@@ -4,6 +4,7 @@ import dotenv from "dotenv";
 import cors from "cors";
 import twilio from "twilio";
 import OpenAI from "openai";
+import { runAgentTurn } from "./llmAgent.js";
 
 dotenv.config();
 
@@ -196,6 +197,35 @@ app.post("/twilio/voice", async (req, res) => {
 
   res.type("text/xml");
   res.send(twiml.toString());
+});
+
+// --- Simple debug endpoint to talk to the agent over HTTP (text only) ---
+app.post("/debug/agent-chat", async (req, res) => {
+  try {
+    const { handle = "waismofit", message } = req.body || {};
+
+    if (!message) {
+      return res.status(400).json({
+        ok: false,
+        error: "Missing 'message' in body",
+      });
+    }
+
+    const result = await runAgentTurn({ handle, userMessage: message });
+
+    res.json({
+      ok: true,
+      reply: result.text,
+      // you can comment this out later
+      raw: result.raw,
+    });
+  } catch (err) {
+    console.error("[/debug/agent-chat] Error", err);
+    res.status(500).json({
+      ok: false,
+      error: err.message || "Internal error",
+    });
+  }
 });
 
 // --- 404 FALLBACK ---
