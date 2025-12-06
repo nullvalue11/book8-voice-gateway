@@ -10,18 +10,26 @@ dotenv.config();
 
 const app = express();
 app.use(cors());
-app.use(express.urlencoded({ extended: false })); // for Twilio form-encoded body
+app.use(express.urlencoded({ extended: false })); // For Twilio form-encoded body
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
+
+// --- NEW HOME ROUTE (fixes "Not Found" in browser) ---
+app.get("/", (req, res) => {
+  res.send(`
+    <h1>Book8 Voice Gateway</h1>
+    <p>Status: <strong>Running</strong></p>
+    <p>Twilio Webhook: <code>POST /twilio/voice</code></p>
+  `);
+});
 
 // Health check
 app.get("/health", (req, res) => {
   res.json({ ok: true, service: "book8-voice-gateway" });
 });
 
-// Basic Twilio voice webhook – for now it just speaks a sentence.
-// We'll later replace this with the full AI agent + /api/agent/availability + /api/agent/book.
+// Twilio voice webhook
 app.post("/twilio/voice", (req, res) => {
   console.log("Incoming call from:", req.body.From);
 
@@ -31,7 +39,7 @@ app.post("/twilio/voice", (req, res) => {
       voice: "Polly.Amy-Neural",
       language: "en-US"
     },
-    "Thanks for calling Book Eight. This is an automated test. Your voice gateway is working."
+    "Thanks for calling Book Eight. Your voice gateway is working."
   );
 
   res.type("text/xml");
@@ -46,4 +54,3 @@ app.use((req, res) => {
 app.listen(PORT, () => {
   console.log(`Voice gateway listening on port ${PORT}`);
 });
-
