@@ -80,55 +80,60 @@ If you are unsure about anything, ask the caller a question instead of guessing.
 `;
 }
 
-// Tool schemas the Realtime model will use.
-// Your Realtime client will register these.
+// Tool schemas for OpenAI chat.completions API
 export const TOOLS = [
   {
-    name: "check_availability",
-    description: "Check available booking slots for a given date and service duration.",
-    parameters: {
-      type: "object",
-      properties: {
-        date: {
-          type: "string",
-          description: "Date in ISO format YYYY-MM-DD in the business timezone."
+    type: "function",
+    function: {
+      name: "check_availability",
+      description: "Check available booking slots for a given date and service duration.",
+      parameters: {
+        type: "object",
+        properties: {
+          date: {
+            type: "string",
+            description: "Date in ISO format YYYY-MM-DD in the business timezone."
+          },
+          durationMinutes: {
+            type: "integer",
+            description: "Desired appointment duration in minutes."
+          }
         },
-        durationMinutes: {
-          type: "integer",
-          description: "Desired appointment duration in minutes."
-        }
-      },
-      required: ["date", "durationMinutes"]
+        required: ["date", "durationMinutes"]
+      }
     }
   },
   {
-    name: "book_appointment",
-    description: "Book an appointment in Book8 for the caller.",
-    parameters: {
-      type: "object",
-      properties: {
-        start: {
-          type: "string",
-          description: "Start datetime in ISO 8601, in the business timezone."
+    type: "function",
+    function: {
+      name: "book_appointment",
+      description: "Book an appointment in Book8 for the caller.",
+      parameters: {
+        type: "object",
+        properties: {
+          start: {
+            type: "string",
+            description: "Start datetime in ISO 8601, in the business timezone."
+          },
+          serviceId: {
+            type: "string",
+            description: "ID of the chosen service (e.g. 'consult_30')."
+          },
+          guestName: {
+            type: "string",
+            description: "Full name of the caller."
+          },
+          guestPhone: {
+            type: "string",
+            description: "Phone number of the caller in E.164 format if possible."
+          },
+          guestEmail: {
+            type: "string",
+            description: "Email if the caller provides it (optional)."
+          }
         },
-        serviceId: {
-          type: "string",
-          description: "ID of the chosen service (e.g. 'consult_30')."
-        },
-        guestName: {
-          type: "string",
-          description: "Full name of the caller."
-        },
-        guestPhone: {
-          type: "string",
-          description: "Phone number of the caller in E.164 format if possible."
-        },
-        guestEmail: {
-          type: "string",
-          description: "Email if the caller provides it (optional)."
-        }
-      },
-      required: ["start", "serviceId", "guestName", "guestPhone"]
+        required: ["start", "serviceId", "guestName", "guestPhone"]
+      }
     }
   }
 ];
