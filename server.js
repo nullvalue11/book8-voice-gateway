@@ -2,7 +2,8 @@
 import express from "express";
 import dotenv from "dotenv";
 import cors from "cors";
-import { twiml as Twiml } from "twilio";
+import twilio from "twilio";
+const { twiml: Twiml } = twilio;
 
 // Load env vars
 dotenv.config();
