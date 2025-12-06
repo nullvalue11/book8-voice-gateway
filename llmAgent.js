@@ -11,7 +11,7 @@ const openai = new OpenAI({
 });
 
 // choose a cost-friendly model here
-const MODEL = "gpt-4.1-mini"; // or "gpt-4o-mini" once GA in responses API
+const MODEL = "gpt-4o-mini"; // Using chat completions API
 
 /**
  * Run a single agent turn:
@@ -30,27 +30,29 @@ export async function runAgentTurn({ handle, userMessage }) {
   ];
 
   // 1. Ask the model; allow tool calls
-  let response = await openai.responses.create({
+  let response = await openai.chat.completions.create({
     model: MODEL,
-    input: messages,
+    messages: messages,
     tools: TOOLS,
     tool_choice: "auto",
   });
 
   // Helper to normalize outputs
-  const firstOutput = response.output?.[0];
-  if (!firstOutput) {
+  const assistantMessage = response.choices[0]?.message;
+  if (!assistantMessage) {
     throw new Error("No output from model");
   }
 
   // 2. If the model wants to call tools, handle them
-  if (firstOutput.type === "tool_call") {
-    const toolCalls = firstOutput.tool_calls || [];
+  if (assistantMessage.tool_calls && assistantMessage.tool_calls.length > 0) {
+    const toolCalls = assistantMessage.tool_calls;
 
     const toolResults = [];
 
     for (const call of toolCalls) {
-      const { name, arguments: args, call_id } = call;
+      const { function: func, id: call_id } = call;
+      const name = func.name;
+      const args = JSON.parse(func.arguments || "{}");
 
       try {
         if (name === "check_availability") {
@@ -124,39 +126,23 @@ export async function runAgentTurn({ handle, userMessage }) {
     }
 
     // 3. Send tool outputs back to the model and get the final reply
-    response = await openai.responses.create({
+    response = await openai.chat.completions.create({
       model: MODEL,
-      input: [
+      messages: [
         ...messages,
-        {
-          role: "assistant",
-          content: [
-            {
-              type: "tool_call",
-              tool_calls: toolCalls,
-            },
-          ],
-        },
+        assistantMessage,
         ...toolResults,
       ],
     });
   }
 
-  const finalOutput = response.output?.[0];
-  if (!finalOutput) {
+  const finalMessage = response.choices[0]?.message;
+  if (!finalMessage) {
     throw new Error("No final output from model");
   }
 
-  if (finalOutput.type === "message") {
-    const text = finalOutput.content
-      .filter((p) => p.type === "text")
-      .map((p) => p.text)
-      .join(" ");
+  const text = finalMessage.content || "Sorry, I couldn't generate a response.";
 
-    return { text, raw: response };
-  }
-
-  // fallback
-  return { text: JSON.stringify(finalOutput), raw: response };
+  return { text, raw: response };
 }
 
