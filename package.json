@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "description": "Voice gateway for Book8 AI phone agent (Twilio -> Book8 APIs -> OpenAI)",
   "main": "server.js",
+  "type": "module",
   "scripts": {
     "start": "node server.js"
   },
