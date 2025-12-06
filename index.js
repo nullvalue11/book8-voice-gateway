@@ -1,4 +1,4 @@
-// index.js – Book8 Voice Gateway with AI Agent
+// index.js
 import express from "express";
 import dotenv from "dotenv";
 import cors from "cors";
@@ -9,184 +9,101 @@ dotenv.config();
 
 const { twiml: Twiml } = twilio;
 
-// ---- Config & clients ----
+// --- ENV ---
+const PORT = process.env.PORT || 3000;
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const BOOK8_BASE_URL = process.env.BOOK8_BASE_URL || "https://book8-ai.vercel.app";
+const BOOK8_AGENT_API_KEY = process.env.BOOK8_AGENT_API_KEY; // will use later
+
+if (!OPENAI_API_KEY) {
+  console.warn("WARNING: OPENAI_API_KEY is not set. The agent will not work.");
+}
+
+const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
+
+// --- EXPRESS SETUP ---
 const app = express();
 app.use(cors());
-app.use(express.urlencoded({ extended: false })); // Twilio sends form-encoded
+app.use(express.urlencoded({ extended: true })); // Twilio sends form-encoded
 app.use(express.json());
 
-const PORT = process.env.PORT || 5050;
+// --- VERY SIMPLE IN-MEMORY SESSION STORE ---
+// key = CallSid, value = { messages: [...] }
+const sessions = new Map();
 
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY
-});
-
-const BOOK8_BASE_URL = process.env.BOOK8_BASE_URL;
-const AGENT_API_KEY = process.env.BOOK8_AGENT_API_KEY;
-
-// in-memory per-call state (good enough for MVP)
-const calls = new Map();
-
-// ---- Helper: get or create call session ----
-function getCallSession(callSid) {
-  if (!calls.has(callSid)) {
-    const systemPrompt =
-      "You are Book8 AI, a friendly phone assistant that books meetings " +
-      "for small businesses using the Book8 scheduling app. " +
-      "You can check availability and create bookings via tools the server provides. " +
-      "Ask natural questions, confirm details (name, email, phone, preferred time), " +
-      "and then use the tools to check availability and book. " +
-      "Always explain clearly what you did for the caller.";
-
-    calls.set(callSid, {
+function getSession(callSid) {
+  if (!sessions.has(callSid)) {
+    sessions.set(callSid, {
       messages: [
-        { role: "system", content: systemPrompt }
+        {
+          role: "system",
+          content: [
+            {
+              type: "text",
+              text:
+                "You are Book8 AI, a friendly phone receptionist for a small business. " +
+                "You talk like a real person: short sentences, warm tone, natural. " +
+                "You can ask questions to understand what the caller wants, " +
+                "and you summarize / clarify details. " +
+                "Avoid sounding like a robot. " +
+                "For now, you cannot directly change the calendar, but you can help " +
+                "the caller decide what they want and tell them that a booking link " +
+                "can be texted or emailed later."
+            }
+          ]
+        }
       ]
     });
   }
-  return calls.get(callSid);
+  return sessions.get(callSid);
 }
 
-// ---- Tools definitions for OpenAI ----
-const tools = [
-  {
-    type: "function",
-    function: {
-      name: "check_availability",
-      description:
-        "Check available time slots for the business on a given date.",
-      parameters: {
-        type: "object",
-        properties: {
-          date: {
-            type: "string",
-            description: "The date to check, in YYYY-MM-DD format."
-          },
-          timezone: {
-            type: "string",
-            description:
-              "IANA timezone string like 'America/Toronto'. If unsure, use the business local timezone."
-          },
-          durationMinutes: {
-            type: "integer",
-            description: "Meeting duration in minutes. Default is 30.",
-            default: 30
-          }
-        },
-        required: ["date"]
-      }
-    }
-  },
-  {
-    type: "function",
-    function: {
-      name: "create_booking",
-      description:
-        "Create a booking for the caller at a specific start time.",
-      parameters: {
-        type: "object",
-        properties: {
-          start: {
-            type: "string",
-            description:
-              "Start datetime in ISO 8601 with timezone offset, e.g. 2025-12-01T14:30:00-05:00."
-          },
-          guestName: {
-            type: "string",
-            description: "Name of the caller."
-          },
-          guestEmail: {
-            type: "string",
-            description: "Email of the caller. Can be omitted if caller refuses."
-          },
-          guestPhone: {
-            type: "string",
-            description: "Phone number of the caller (E.164 if possible)."
-          },
-          notes: {
-            type: "string",
-            description:
-              "Any extra notes about the appointment or caller's preferences."
-          }
-        },
-        required: ["start", "guestName", "guestPhone"]
-      }
-    }
-  }
-];
-
-// ---- Tool executors (Book8 APIs) ----
-async function tool_checkAvailability(args) {
-  const payload = {
-    agentApiKey: AGENT_API_KEY,
-    date: args.date,
-    timezone: args.timezone || "America/Toronto",
-    durationMinutes: args.durationMinutes || 30
-  };
-
-  const res = await fetch(`${BOOK8_BASE_URL}/api/agent/availability`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify(payload)
-  });
-
-  const data = await res.json().catch(() => ({}));
-  return data;
-}
-
-async function tool_createBooking(args) {
-  const payload = {
-    agentApiKey: AGENT_API_KEY,
-    start: args.start,
-    guestName: args.guestName,
-    guestEmail: args.guestEmail || "",
-    guestPhone: args.guestPhone,
-    notes: args.notes || "",
-    source: "phone-agent"
-  };
-
-  const res = await fetch(`${BOOK8_BASE_URL}/api/agent/book`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify(payload)
-  });
-
-  const data = await res.json().catch(() => ({}));
-  return data;
-}
-
-// ---- Root page (debug info) ----
-app.get("/", (_req, res) => {
+// --- HOME PAGE ---
+app.get("/", (req, res) => {
   res.send(`
     <h1>Book8 Voice Gateway</h1>
     <p>Status: <strong>Running</strong></p>
-    <p>Twilio Webhook: <code>POST /twilio/voice</code></p>
+    <p>Twilio Webhook: <strong>POST /twilio/voice</strong></p>
   `);
 });
 
-// ---- Health check ----
-app.get("/health", (_req, res) => {
+// --- HEALTH CHECK ---
+app.get("/health", (req, res) => {
   res.json({ ok: true, service: "book8-voice-gateway" });
 });
 
-// ---- Main Twilio voice webhook ----
+// --- MAIN TWILIO VOICE WEBHOOK ---
+// Twilio hits this endpoint multiple times in a call.
+// Flow:
+//  1. First hit: no SpeechResult -> we greet the caller & <Gather> speech.
+//  2. Next hits: Twilio includes SpeechResult -> we send to OpenAI, get reply,
+//     then <Gather> again for the next user turn.
 app.post("/twilio/voice", async (req, res) => {
-  const vr = new Twiml.VoiceResponse();
-  const callSid = req.body.CallSid;
-  const speechResult = req.body.SpeechResult;
-  const fromNumber = req.body.From;
+  const twiml = new Twiml.VoiceResponse();
+  const {
+    CallSid,
+    From,
+    SpeechResult,
+    Confidence,
+    CallStatus
+  } = req.body || {};
 
-  const session = getCallSession(callSid);
+  console.log("---- Incoming Twilio webhook ----");
+  console.log("CallSid:", CallSid, "From:", From, "Status:", CallStatus);
+  console.log("SpeechResult:", SpeechResult, "Confidence:", Confidence);
 
-  // First hit: no speech yet → greet and gather speech
-  if (!speechResult) {
-    console.log("New call from", fromNumber, "CallSid:", callSid);
+  // If the call is ending, clean up session
+  if (CallStatus === "completed" || CallStatus === "busy" || CallStatus === "no-answer") {
+    sessions.delete(CallSid);
+    res.type("text/xml");
+    return res.send(twiml.toString());
+  }
 
-    const gather = vr.gather({
+  const session = getSession(CallSid);
+
+  // FIRST TURN: no SpeechResult yet -> greet + ask how to help
+  if (!SpeechResult) {
+    const gather = twiml.gather({
       input: "speech",
       speechTimeout: "auto",
       action: "/twilio/voice",
@@ -198,127 +115,92 @@ app.post("/twilio/voice", async (req, res) => {
         voice: "Polly.Amy-Neural",
         language: "en-US"
       },
-      "Hi, thanks for calling Book Eight. I'm your AI assistant. " +
+      "Hi! Thanks for calling. This is the Book Eight A.I. assistant. " +
         "How can I help you today?"
     );
 
-    vr.say(
+    // If no speech at all, we'll hang up politely
+    twiml.say(
       {
         voice: "Polly.Amy-Neural",
         language: "en-US"
       },
-      "Sorry, I didn't catch that. Please call again later. Goodbye."
+      "Hmm, I didn't quite hear anything. If you need help later, feel free to call again."
     );
+    twiml.hangup();
 
-    res.type("text/xml").send(vr.toString());
-    return;
+    res.type("text/xml");
+    return res.send(twiml.toString());
   }
 
-  // We got speech from caller
-  const userText = speechResult;
-  console.log(`[${callSid}] Caller said:`, userText);
+  // SUBSEQUENT TURNS: we have SpeechResult -> send to OpenAI
+  session.messages.push({
+    role: "user",
+    content: [{ type: "text", text: SpeechResult }]
+  });
 
-  session.messages.push({ role: "user", content: userText });
+  let aiText = "Sorry, I'm having trouble understanding right now. Could you repeat that?";
 
   try {
-    // 1st pass: let the model decide whether to call tools
-    const completion = await openai.chat.completions.create({
+    const response = await openai.responses.create({
       model: "gpt-4.1-mini",
-      messages: session.messages,
-      tools,
-      tool_choice: "auto"
+      input: session.messages
     });
 
-    let assistantMessage = completion.choices[0].message;
-    session.messages.push(assistantMessage);
-
-    // If there are tool calls, execute them and call the model again
-    if (assistantMessage.tool_calls?.length) {
-      for (const toolCall of assistantMessage.tool_calls) {
-        const toolName = toolCall.function.name;
-        const args = JSON.parse(toolCall.function.arguments || "{}");
-        let result;
-
-        console.log(`[${callSid}] Tool called: ${toolName}`, args);
-
-        if (toolName === "check_availability") {
-          result = await tool_checkAvailability(args);
-        } else if (toolName === "create_booking") {
-          result = await tool_createBooking(args);
-        } else {
-          result = { ok: false, error: "Unknown tool" };
-        }
-
+    // The responses API returns an array of content blocks
+    const output = response.output?.[0];
+    if (output && output.type === "message") {
+      const textPart = output.content.find(p => p.type === "text");
+      if (textPart) {
+        aiText = textPart.text;
+        // store assistant message back into session
         session.messages.push({
-          role: "tool",
-          tool_call_id: toolCall.id,
-          content: JSON.stringify(result)
+          role: "assistant",
+          content: [{ type: "text", text: aiText }]
         });
       }
-
-      // 2nd pass: get a natural language answer using tool results
-      const followup = await openai.chat.completions.create({
-        model: "gpt-4.1-mini",
-        messages: session.messages
-      });
-
-      assistantMessage = followup.choices[0].message;
-      session.messages.push(assistantMessage);
     }
 
-    const replyText = assistantMessage.content || "Sorry, something went wrong.";
-
-    console.log(`[${callSid}] Assistant:`, replyText);
-
-    // Reply and gather next user utterance
-    const gather = vr.gather({
-      input: "speech",
-      speechTimeout: "auto",
-      action: "/twilio/voice",
-      method: "POST"
-    });
-
-    gather.say(
-      {
-        voice: "Polly.Amy-Neural",
-        language: "en-US"
-      },
-      replyText
-    );
-
-    vr.say(
-      {
-        voice: "Polly.Amy-Neural",
-        language: "en-US"
-      },
-      "We got disconnected. Please call again if you need anything else. Goodbye."
-    );
-
-    res.type("text/xml").send(vr.toString());
+    console.log("AI:", aiText);
   } catch (err) {
-    console.error(`[${callSid}] Error in AI flow`, err);
-
-    vr.say(
-      {
-        voice: "Polly.Amy-Neural",
-        language: "en-US"
-      },
-      "Sorry, I had a problem processing your request. Please try again later."
-    );
-
-    res.type("text/xml").send(vr.toString());
+    console.error("OpenAI error:", err);
+    aiText =
+      "I'm sorry, I'm having an issue right now. Please try again later or use the online booking link.";
   }
+
+  // Reply to caller + keep conversation going with another <Gather>
+  const gather = twiml.gather({
+    input: "speech",
+    speechTimeout: "auto",
+    action: "/twilio/voice",
+    method: "POST"
+  });
+
+  gather.say(
+    {
+      voice: "Polly.Amy-Neural",
+      language: "en-US"
+    },
+    aiText
+  );
+
+  // Safety: if user goes silent, we'll end after this turn.
+  twiml.say(
+    {
+      voice: "Polly.Amy-Neural",
+      language: "en-US"
+    },
+    "If you don't say anything, I'll end the call. You can always call back."
+  );
+  twiml.hangup();
+
+  res.type("text/xml");
+  res.send(twiml.toString());
 });
 
-// ---- Cleanup on hangup (optional) ----
-app.post("/twilio/status", (req, res) => {
-  const callSid = req.body.CallSid;
-  const callStatus = req.body.CallStatus;
-  if (["completed", "failed", "busy", "no-answer"].includes(callStatus)) {
-    calls.delete(callSid);
-    console.log("Cleaned up call session:", callSid, "status:", callStatus);
-  }
-  res.sendStatus(200);
+// --- 404 FALLBACK ---
+app.use((req, res) => {
+  res.status(404).json({ ok: false, error: "Not found" });
 });
 
 app.listen(PORT, () => {
