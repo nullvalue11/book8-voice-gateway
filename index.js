@@ -216,10 +216,13 @@ app.post("/debug/agent-chat", async (req, res) => {
     const systemPrompt = buildSystemPrompt(profile);
 
     // 2) First call: ask the model what to do (with tools enabled)
-    const first = await openai.responses.create({
-      model: "gpt-4.1-mini",
-      instructions: systemPrompt,
-      input: [
+    const first = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [
+        {
+          role: "system",
+          content: systemPrompt
+        },
         {
           role: "user",
           content: message
@@ -231,24 +234,20 @@ app.post("/debug/agent-chat", async (req, res) => {
 
     console.log("FIRST RESPONSE RAW:", JSON.stringify(first, null, 2));
 
-    // Extract any tool calls
-    const toolCalls = [];
-    const textParts = [];
-
-    for (const item of first.output) {
-      if (item.type === "output_text" && item.output_text && item.output_text.text) {
-        textParts.push(item.output_text.text);
-      }
-      if (item.type === "tool_call") {
-        toolCalls.push(item);
-      }
+    const assistantMessage = first.choices[0]?.message;
+    if (!assistantMessage) {
+      throw new Error("No response from model");
     }
+
+    // Extract any tool calls
+    const toolCalls = assistantMessage.tool_calls || [];
+    const textContent = assistantMessage.content || "";
 
     // If there are NO tool calls, just return what it said
     if (toolCalls.length === 0) {
       return res.json({
         ok: true,
-        reply: textParts.join(" "),
+        reply: textContent,
         raw: first,
         note: "No tool calls in first response"
       });
@@ -258,11 +257,9 @@ app.post("/debug/agent-chat", async (req, res) => {
     const toolOutputs = [];
 
     for (const tc of toolCalls) {
-      // Handle different possible structures
-      const toolCallData = tc.tool_call || tc;
-      const name = toolCallData.name || toolCallData.function?.name;
-      const args = toolCallData.arguments || (toolCallData.function ? JSON.parse(toolCallData.function.arguments || "{}") : {});
-      const call_id = toolCallData.call_id || toolCallData.id || tc.id;
+      const name = tc.function?.name;
+      const args = JSON.parse(tc.function?.arguments || "{}");
+      const call_id = tc.id;
       console.log("Processing tool call:", name, args);
 
       if (name === "check_availability") {
@@ -284,8 +281,9 @@ app.post("/debug/agent-chat", async (req, res) => {
         console.log("check_availability result:", data);
 
         toolOutputs.push({
-          tool_call_id: call_id || tc.id,
-          output: JSON.stringify(data)
+          role: "tool",
+          tool_call_id: call_id,
+          content: JSON.stringify(data)
         });
       }
 
@@ -308,38 +306,37 @@ app.post("/debug/agent-chat", async (req, res) => {
         console.log("book_appointment result:", data);
 
         toolOutputs.push({
-          tool_call_id: call_id || tc.id,
-          output: JSON.stringify(data)
+          role: "tool",
+          tool_call_id: call_id,
+          content: JSON.stringify(data)
         });
       }
     }
 
     // 4) Second call: give the tool results back to the model to generate the final reply
-    const second = await openai.responses.create({
-      model: "gpt-4.1-mini",
-      instructions: systemPrompt,
-      input: [
+    const second = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [
+        {
+          role: "system",
+          content: systemPrompt
+        },
         {
           role: "user",
           content: message
         },
-        {
+        assistantMessage,
+        ...toolOutputs.map((t) => ({
           role: "tool",
-          content: toolOutputs.map((t) => ({
-            type: "tool_result",
-            tool_call_id: t.tool_call_id,
-            output: t.output
-          }))
-        }
+          tool_call_id: t.tool_call_id,
+          content: t.output
+        }))
       ]
     });
 
     console.log("SECOND RESPONSE RAW:", JSON.stringify(second, null, 2));
 
-    const finalText = second.output
-      .filter((o) => o.type === "output_text")
-      .map((o) => o.output_text.text)
-      .join(" ");
+    const finalText = second.choices[0]?.message?.content || "Sorry, I couldn't generate a response.";
 
     return res.json({
       ok: true,
