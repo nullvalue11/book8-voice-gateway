@@ -4,7 +4,7 @@ import dotenv from "dotenv";
 import cors from "cors";
 import twilio from "twilio";
 import OpenAI from "openai";
-import { runAgentTurn } from "./llmAgent.js";
+import { buildSystemPrompt, tools, getBusinessProfile } from "./agentConfig.js";
 
 dotenv.config();
 
@@ -202,28 +202,158 @@ app.post("/twilio/voice", async (req, res) => {
 // --- Simple debug endpoint to talk to the agent over HTTP (text only) ---
 app.post("/debug/agent-chat", async (req, res) => {
   try {
-    const { handle = "waismofit", message } = req.body || {};
+    const { handle, message } = req.body || {};
 
-    if (!message) {
+    if (!handle || !message) {
       return res.status(400).json({
         ok: false,
-        error: "Missing 'message' in body",
+        error: "Missing 'handle' or 'message' in request body"
       });
     }
 
-    const result = await runAgentTurn({ handle, userMessage: message });
+    // 1) Get business profile & system instructions
+    const profile = await getBusinessProfile(handle);
+    const systemPrompt = buildSystemPrompt(profile);
 
-    res.json({
+    // 2) First call: ask the model what to do (with tools enabled)
+    const first = await openai.responses.create({
+      model: "gpt-4.1-mini",
+      instructions: systemPrompt,
+      input: [
+        {
+          role: "user",
+          content: message
+        }
+      ],
+      tools,                  // 👈 from agentConfig.js
+      tool_choice: "auto"     // let it decide when to call tools
+    });
+
+    console.log("FIRST RESPONSE RAW:", JSON.stringify(first, null, 2));
+
+    // Extract any tool calls
+    const toolCalls = [];
+    const textParts = [];
+
+    for (const item of first.output) {
+      if (item.type === "output_text" && item.output_text && item.output_text.text) {
+        textParts.push(item.output_text.text);
+      }
+      if (item.type === "tool_call") {
+        toolCalls.push(item);
+      }
+    }
+
+    // If there are NO tool calls, just return what it said
+    if (toolCalls.length === 0) {
+      return res.json({
+        ok: true,
+        reply: textParts.join(" "),
+        raw: first,
+        note: "No tool calls in first response"
+      });
+    }
+
+    // 3) Execute tool calls against Book8
+    const toolOutputs = [];
+
+    for (const tc of toolCalls) {
+      // Handle different possible structures
+      const toolCallData = tc.tool_call || tc;
+      const name = toolCallData.name || toolCallData.function?.name;
+      const args = toolCallData.arguments || (toolCallData.function ? JSON.parse(toolCallData.function.arguments || "{}") : {});
+      const call_id = toolCallData.call_id || toolCallData.id || tc.id;
+      console.log("Processing tool call:", name, args);
+
+      if (name === "check_availability") {
+        // Expecting: { date, timezone, durationMinutes }
+        const resp = await fetch(`${BOOK8_BASE_URL}/api/agent/availability`, {
+          method: "POST",
+          headers: { 
+            "Content-Type": "application/json",
+            "x-book8-agent-key": profile.agentApiKey
+          },
+          body: JSON.stringify({
+            date: args.date,
+            timezone: args.timezone,
+            durationMinutes: args.durationMinutes
+          })
+        });
+
+        const data = await resp.json();
+        console.log("check_availability result:", data);
+
+        toolOutputs.push({
+          tool_call_id: call_id || tc.id,
+          output: JSON.stringify(data)
+        });
+      }
+
+      if (name === "book_appointment") {
+        const resp = await fetch(`${BOOK8_BASE_URL}/api/agent/book`, {
+          method: "POST",
+          headers: { 
+            "Content-Type": "application/json",
+            "x-book8-agent-key": profile.agentApiKey
+          },
+          body: JSON.stringify({
+            start: args.start,
+            guestName: args.guestName,
+            guestEmail: args.guestEmail,
+            guestPhone: args.guestPhone
+          })
+        });
+
+        const data = await resp.json();
+        console.log("book_appointment result:", data);
+
+        toolOutputs.push({
+          tool_call_id: call_id || tc.id,
+          output: JSON.stringify(data)
+        });
+      }
+    }
+
+    // 4) Second call: give the tool results back to the model to generate the final reply
+    const second = await openai.responses.create({
+      model: "gpt-4.1-mini",
+      instructions: systemPrompt,
+      input: [
+        {
+          role: "user",
+          content: message
+        },
+        {
+          role: "tool",
+          content: toolOutputs.map((t) => ({
+            type: "tool_result",
+            tool_call_id: t.tool_call_id,
+            output: t.output
+          }))
+        }
+      ]
+    });
+
+    console.log("SECOND RESPONSE RAW:", JSON.stringify(second, null, 2));
+
+    const finalText = second.output
+      .filter((o) => o.type === "output_text")
+      .map((o) => o.output_text.text)
+      .join(" ");
+
+    return res.json({
       ok: true,
-      reply: result.text,
-      // you can comment this out later
-      raw: result.raw,
+      reply: finalText,
+      first,
+      second,
+      toolCalls,
+      toolOutputs
     });
   } catch (err) {
-    console.error("[/debug/agent-chat] Error", err);
-    res.status(500).json({
+    console.error("Error in /debug/agent-chat:", err);
+    return res.status(500).json({
       ok: false,
-      error: err.message || "Internal error",
+      error: err.message || "Internal error in agent-chat"
     });
   }
 });

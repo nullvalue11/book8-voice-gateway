@@ -1,4 +1,7 @@
 // agentConfig.js
+import dotenv from "dotenv";
+
+dotenv.config();
 
 // 1) Static business profile for now.
 // Later we can fetch this from Book8 via HTTP.
@@ -70,8 +73,12 @@ Policies:
 - Cancellation: ${profile.policies.cancellation}
 - Location: ${profile.policies.location}
 
-Tool usage:
+CRITICAL TOOL USAGE RULES:
 
+- If you need to check times or book, you MUST use the tools check_availability and book_appointment.
+- Never say "I can't check availability" — always call the check_availability tool instead.
+- When a caller asks about availability, you MUST call check_availability before responding.
+- When a caller wants to book, you MUST call book_appointment with all required details.
 - Use **check_availability** to find free slots BEFORE you propose specific times.
 - Use **book_appointment** ONLY after the caller confirms the desired slot.
 - If tools return errors (e.g., slot taken), calmly explain and try another time.
@@ -80,26 +87,30 @@ If you are unsure about anything, ask the caller a question instead of guessing.
 `;
 }
 
-// Tool schemas for OpenAI chat.completions API
-export const TOOLS = [
+// Helper to get business profile by handle (for now, just return static profile)
+export async function getBusinessProfile(handle) {
+  // For now, return static profile. Later we can fetch from Book8 API
+  const profile = { ...BUSINESS_PROFILE };
+  // Add agentApiKey from env for now
+  profile.agentApiKey = process.env.BOOK8_AGENT_API_KEY;
+  return profile;
+}
+
+// Tool schemas for OpenAI responses API
+export const tools = [
   {
     type: "function",
     function: {
       name: "check_availability",
-      description: "Check available booking slots for a given date and service duration.",
+      description: "Check available time slots for the business on a given day.",
       parameters: {
         type: "object",
         properties: {
-          date: {
-            type: "string",
-            description: "Date in ISO format YYYY-MM-DD in the business timezone."
-          },
-          durationMinutes: {
-            type: "integer",
-            description: "Desired appointment duration in minutes."
-          }
+          date: { type: "string", description: "ISO date, e.g. 2025-12-01" },
+          timezone: { type: "string", description: "IANA timezone" },
+          durationMinutes: { type: "number" }
         },
-        required: ["date", "durationMinutes"]
+        required: ["date", "timezone", "durationMinutes"]
       }
     }
   },
@@ -107,36 +118,23 @@ export const TOOLS = [
     type: "function",
     function: {
       name: "book_appointment",
-      description: "Book an appointment in Book8 for the caller.",
+      description: "Book an appointment in the schedule.",
       parameters: {
         type: "object",
         properties: {
-          start: {
-            type: "string",
-            description: "Start datetime in ISO 8601, in the business timezone."
-          },
-          serviceId: {
-            type: "string",
-            description: "ID of the chosen service (e.g. 'consult_30')."
-          },
-          guestName: {
-            type: "string",
-            description: "Full name of the caller."
-          },
-          guestPhone: {
-            type: "string",
-            description: "Phone number of the caller in E.164 format if possible."
-          },
-          guestEmail: {
-            type: "string",
-            description: "Email if the caller provides it (optional)."
-          }
+          start: { type: "string", description: "ISO datetime with timezone" },
+          guestName: { type: "string" },
+          guestEmail: { type: "string" },
+          guestPhone: { type: "string" }
         },
-        required: ["start", "serviceId", "guestName", "guestPhone"]
+        required: ["start", "guestName"]
       }
     }
   }
 ];
+
+// Also export as TOOLS for backward compatibility
+export const TOOLS = tools;
 
 // Helper to map a service label → duration (for the tools)
 export function getServiceById(profile, serviceId) {
