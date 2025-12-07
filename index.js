@@ -31,43 +31,19 @@ app.use(express.json());
 const { twiml: Twiml } = twilio;
 const VoiceResponse = Twiml.VoiceResponse;
 
-// --- VERY SIMPLE IN-MEMORY SESSION STORE ---
-// key = CallSid, value = { messages: [...] }
-const sessions = new Map();
+// Helper: where to send text to the agent
+const VOICE_AGENT_URL =
+  process.env.VOICE_AGENT_URL ||
+  "https://book8-voice-gateway.onrender.com/debug/agent-chat";
 
-function getSession(callSid) {
-  if (!sessions.has(callSid)) {
-    sessions.set(callSid, {
-      messages: [
-        {
-          role: "system",
-          content: [
-            {
-              type: "text",
-              text:
-                "You are Book8 AI, a friendly phone receptionist for a small business. " +
-                "You talk like a real person: short sentences, warm tone, natural. " +
-                "You can ask questions to understand what the caller wants, " +
-                "and you summarize / clarify details. " +
-                "Avoid sounding like a robot. " +
-                "For now, you cannot directly change the calendar, but you can help " +
-                "the caller decide what they want and tell them that a booking link " +
-                "can be texted or emailed later."
-            }
-          ]
-        }
-      ]
-    });
-  }
-  return sessions.get(callSid);
-}
+const DEFAULT_HANDLE = process.env.DEFAULT_HANDLE || "waismofit";
 
 // --- HOME PAGE ---
 app.get("/", (req, res) => {
   res.send(`
     <h1>Book8 Voice Gateway</h1>
-    <p>Status: <strong>Running</strong></p>
-    <p>Twilio Webhook: <strong>POST /twilio/voice</strong></p>
+    <p>Status: <b>Running</b></p>
+    <p>Twilio Webhook: POST /twilio/voice</p>
   `);
 });
 
@@ -76,130 +52,115 @@ app.get("/health", (req, res) => {
   res.json({ ok: true, service: "book8-voice-gateway" });
 });
 
-// --- MAIN TWILIO VOICE WEBHOOK ---
-// Twilio hits this endpoint multiple times in a call.
-// Flow:
-//  1. First hit: no SpeechResult -> we greet the caller & <Gather> speech.
-//  2. Next hits: Twilio includes SpeechResult -> we send to OpenAI, get reply,
-//     then <Gather> again for the next user turn.
-app.post("/twilio/voice", async (req, res) => {
-  const twiml = new VoiceResponse();
-  const {
-    CallSid,
-    From,
-    SpeechResult,
-    Confidence,
-    CallStatus
-  } = req.body || {};
+// ---------------------------------------------------------------------
+//  Twilio entrypoint: /twilio/voice
+//  - Greets the caller
+//  - Starts a <Gather> for speech
+// ---------------------------------------------------------------------
+app.post("/twilio/voice", (req, res) => {
+  console.log("Incoming call from:", req.body.From);
 
-  console.log("---- Incoming Twilio webhook ----");
-  console.log("CallSid:", CallSid, "From:", From, "Status:", CallStatus);
-  console.log("SpeechResult:", SpeechResult, "Confidence:", Confidence);
+  const vr = new VoiceResponse();
 
-  // If the call is ending, clean up session
-  if (CallStatus === "completed" || CallStatus === "busy" || CallStatus === "no-answer") {
-    sessions.delete(CallSid);
-    res.type("text/xml");
-    return res.send(twiml.toString());
-  }
-
-  const session = getSession(CallSid);
-
-  // FIRST TURN: no SpeechResult yet -> greet + ask how to help
-  if (!SpeechResult) {
-    const gather = twiml.gather({
-      input: "speech",
-      speechTimeout: "auto",
-      action: "/twilio/voice",
-      method: "POST"
-    });
-
-    gather.say(
-      {
-        voice: "Polly.Amy-Neural",
-        language: "en-US"
-      },
-      "Hi! Thanks for calling. This is the Book Eight A.I. assistant. " +
-        "How can I help you today?"
-    );
-
-    // If no speech at all, we'll hang up politely
-    twiml.say(
-      {
-        voice: "Polly.Amy-Neural",
-        language: "en-US"
-      },
-      "Hmm, I didn't quite hear anything. If you need help later, feel free to call again."
-    );
-    twiml.hangup();
-
-    res.type("text/xml");
-    return res.send(twiml.toString());
-  }
-
-  // SUBSEQUENT TURNS: we have SpeechResult -> send to OpenAI
-  session.messages.push({
-    role: "user",
-    content: [{ type: "text", text: SpeechResult }]
-  });
-
-  let aiText = "Sorry, I'm having trouble understanding right now. Could you repeat that?";
-
-  try {
-    const response = await openai.responses.create({
-      model: "gpt-4.1-mini",
-      input: session.messages
-    });
-
-    // The responses API returns an array of content blocks
-    const output = response.output?.[0];
-    if (output && output.type === "message") {
-      const textPart = output.content.find(p => p.type === "text");
-      if (textPart) {
-        aiText = textPart.text;
-        // store assistant message back into session
-        session.messages.push({
-          role: "assistant",
-          content: [{ type: "text", text: aiText }]
-        });
-      }
-    }
-
-    console.log("AI:", aiText);
-  } catch (err) {
-    console.error("OpenAI error:", err);
-    aiText =
-      "I'm sorry, I'm having an issue right now. Please try again later or use the online booking link.";
-  }
-
-  // Reply to caller + keep conversation going with another <Gather>
-  const gather = twiml.gather({
+  // Gather caller speech and send it to /twilio/handle-gather
+  const gather = vr.gather({
     input: "speech",
-    speechTimeout: "auto",
-    action: "/twilio/voice",
-    method: "POST"
+    action: "/twilio/handle-gather",
+    method: "POST",
+    language: "en-US",
+    speechTimeout: "auto"
   });
 
   gather.say(
     {
-      voice: "Polly.Amy-Neural",
+      voice: "Polly.Joanna-Neural",
       language: "en-US"
     },
-    aiText
+    "Hi, this is Book Eight A I. How can I help you today?"
   );
 
-  // Safety: if user goes silent, we'll end after this turn.
-  twiml.say(
-    {
-      voice: "Polly.Amy-Neural",
-      language: "en-US"
-    },
-    "If you don't say anything, I'll end the call. You can always call back."
-  );
-  twiml.hangup();
+  // If nothing is said, loop back
+  vr.redirect("/twilio/voice");
 
   res.type("text/xml");
-  res.send(twiml.toString());
+  res.send(vr.toString());
+});
+
+// ---------------------------------------------------------------------
+//  Twilio speech handler: /twilio/handle-gather
+//  - Receives SpeechResult from Twilio
+//  - Sends it to the agent (/debug/agent-chat)
+//  - Speaks the agent's reply back to the caller
+//  - Starts another <Gather> for multi-turn conversation
+// ---------------------------------------------------------------------
+app.post("/twilio/handle-gather", async (req, res) => {
+  const speech = req.body.SpeechResult;
+  const from = req.body.From;
+
+  console.log("Twilio SpeechResult:", speech, "from", from);
+
+  let replyText =
+    "I'm sorry, I didn't quite catch that. Could you please repeat what you need?";
+
+  if (speech && speech.trim().length > 0) {
+    try {
+      // Call your existing agent endpoint
+      const agentRes = await fetch(VOICE_AGENT_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          handle: DEFAULT_HANDLE,
+          message: speech,
+          // You can pass caller metadata if you want the agent to use it
+          meta: {
+            from
+          }
+        })
+      });
+
+      const agentJson = await agentRes.json();
+      console.log("Agent response:", agentJson);
+
+      if (agentJson && agentJson.reply) {
+        replyText = agentJson.reply;
+      }
+    } catch (err) {
+      console.error("Error talking to agent:", err);
+      replyText =
+        "I'm having trouble reaching the scheduling system right now. Please try again later.";
+    }
+  }
+
+  const vr = new VoiceResponse();
+
+  // Speak the agent's reply
+  vr.say(
+    {
+      voice: "Polly.Joanna-Neural",
+      language: "en-US"
+    },
+    replyText
+  );
+
+  // Ask if they want to continue (multi-turn)
+  const gather = vr.gather({
+    input: "speech",
+    action: "/twilio/handle-gather",
+    method: "POST",
+    language: "en-US",
+    speechTimeout: "auto"
+  });
+
+  gather.say(
+    {
+      voice: "Polly.Joanna-Neural",
+      language: "en-US"
+    },
+    "You can ask another question, book another appointment, or say goodbye to end the call."
+  );
+
+  res.type("text/xml");
+  res.send(vr.toString());
 });
 
 // --- Simple debug endpoint to talk to the agent over HTTP (text only) ---
