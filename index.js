@@ -316,7 +316,7 @@ app.post("/debug/agent-chat", async (req, res) => {
     }
 
     // 4) Second call: give the tool results back to the model to generate the final reply
-    const second = await openai.chat.completions.create({
+    let second = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       messages: [
         {
@@ -329,12 +329,111 @@ app.post("/debug/agent-chat", async (req, res) => {
         },
         assistantMessage,
         ...toolOutputs
-      ]
+      ],
+      tools,
+      tool_choice: "auto"
     });
 
     console.log("SECOND RESPONSE RAW:", JSON.stringify(second, null, 2));
 
-    const finalText = second.choices[0]?.message?.content || "Sorry, I couldn't generate a response.";
+    const secondMessage = second.choices[0]?.message;
+    
+    // Check if the second response also wants to call tools (e.g., book_appointment after check_availability)
+    if (secondMessage.tool_calls && secondMessage.tool_calls.length > 0) {
+      const secondToolCalls = secondMessage.tool_calls;
+      const secondToolOutputs = [];
+
+      for (const tc of secondToolCalls) {
+        const name = tc.function?.name;
+        const args = JSON.parse(tc.function?.arguments || "{}");
+        const call_id = tc.id;
+        console.log("Processing second tool call:", name, args);
+
+        if (name === "check_availability") {
+          const resp = await fetch(`${BOOK8_BASE_URL}/api/agent/availability`, {
+            method: "POST",
+            headers: { 
+              "Content-Type": "application/json",
+              "x-book8-agent-key": profile.agentApiKey
+            },
+            body: JSON.stringify({
+              agentApiKey: profile.agentApiKey,
+              date: args.date,
+              timezone: args.timezone,
+              durationMinutes: args.durationMinutes
+            })
+          });
+
+          const data = await resp.json();
+          console.log("check_availability result:", data);
+
+          secondToolOutputs.push({
+            role: "tool",
+            tool_call_id: call_id,
+            content: JSON.stringify(data)
+          });
+        }
+
+        if (name === "book_appointment") {
+          const resp = await fetch(`${BOOK8_BASE_URL}/api/agent/book`, {
+            method: "POST",
+            headers: { 
+              "Content-Type": "application/json",
+              "x-book8-agent-key": profile.agentApiKey
+            },
+            body: JSON.stringify({
+              agentApiKey: profile.agentApiKey,
+              start: args.start,
+              guestName: args.guestName,
+              guestEmail: args.guestEmail,
+              guestPhone: args.guestPhone
+            })
+          });
+
+          const data = await resp.json();
+          console.log("book_appointment result:", data);
+
+          secondToolOutputs.push({
+            role: "tool",
+            tool_call_id: call_id,
+            content: JSON.stringify(data)
+          });
+        }
+      }
+
+      // Third call: get final response after second round of tool calls
+      const third = await openai.chat.completions.create({
+        model: "gpt-4o-mini",
+        messages: [
+          {
+            role: "system",
+            content: systemPrompt
+          },
+          {
+            role: "user",
+            content: message
+          },
+          assistantMessage,
+          ...toolOutputs,
+          secondMessage,
+          ...secondToolOutputs
+        ]
+      });
+
+      const finalText = third.choices[0]?.message?.content || "Sorry, I couldn't generate a response.";
+
+      return res.json({
+        ok: true,
+        reply: finalText,
+        first,
+        second,
+        third,
+        toolCalls: [...toolCalls, ...secondToolCalls],
+        toolOutputs: [...toolOutputs, ...secondToolOutputs]
+      });
+    }
+
+    const finalText = secondMessage?.content || "Sorry, I couldn't generate a response.";
 
     return res.json({
       ok: true,
