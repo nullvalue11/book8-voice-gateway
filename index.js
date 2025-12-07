@@ -326,11 +326,7 @@ app.post("/debug/agent-chat", async (req, res) => {
           content: message
         },
         assistantMessage,
-        ...toolOutputs.map((t) => ({
-          role: "tool",
-          tool_call_id: t.tool_call_id,
-          content: t.output
-        }))
+        ...toolOutputs
       ]
     });
 
