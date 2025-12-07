@@ -8,10 +8,8 @@ import { buildSystemPrompt, tools, getBusinessProfile } from "./agentConfig.js";
 
 dotenv.config();
 
-const { twiml: Twiml } = twilio;
-
 // --- ENV ---
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 10000;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const BOOK8_BASE_URL = process.env.BOOK8_BASE_URL || "https://book8-ai.vercel.app";
 const BOOK8_AGENT_API_KEY = process.env.BOOK8_AGENT_API_KEY; // will use later
@@ -25,8 +23,13 @@ const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 // --- EXPRESS SETUP ---
 const app = express();
 app.use(cors());
-app.use(express.urlencoded({ extended: true })); // Twilio sends form-encoded
+
+// Twilio posts as x-www-form-urlencoded by default:
+app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
+
+const { twiml: Twiml } = twilio;
+const VoiceResponse = Twiml.VoiceResponse;
 
 // --- VERY SIMPLE IN-MEMORY SESSION STORE ---
 // key = CallSid, value = { messages: [...] }
@@ -80,7 +83,7 @@ app.get("/health", (req, res) => {
 //  2. Next hits: Twilio includes SpeechResult -> we send to OpenAI, get reply,
 //     then <Gather> again for the next user turn.
 app.post("/twilio/voice", async (req, res) => {
-  const twiml = new Twiml.VoiceResponse();
+  const twiml = new VoiceResponse();
   const {
     CallSid,
     From,
