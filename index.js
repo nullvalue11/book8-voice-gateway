@@ -94,7 +94,13 @@ app.post("/twilio/voice", (req, res) => {
 //  - Starts another <Gather> for multi-turn conversation
 // ---------------------------------------------------------------------
 app.post("/twilio/handle-gather", async (req, res) => {
-  const speech = req.body.SpeechResult;
+  const vr = new VoiceResponse();
+
+  const speech =
+    req.body.SpeechResult ||
+    req.body.TranscriptionText ||
+    req.body.Body ||
+    "";
   const from = req.body.From;
 
   console.log("Twilio SpeechResult:", speech, "from", from);
@@ -104,12 +110,12 @@ app.post("/twilio/handle-gather", async (req, res) => {
 
   if (speech && speech.trim().length > 0) {
     try {
-      // Call your existing agent endpoint
+      // ✅ IMPORTANT: tell the agent which business to use
       const agentRes = await fetch(VOICE_AGENT_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          handle: DEFAULT_HANDLE,
+          handle: "waismofit",        // <—— hard-coded for now
           message: speech,
           // You can pass caller metadata if you want the agent to use it
           meta: {
@@ -118,20 +124,24 @@ app.post("/twilio/handle-gather", async (req, res) => {
         })
       });
 
+      if (!agentRes.ok) {
+        throw new Error(`Agent API returned ${agentRes.status}: ${agentRes.statusText}`);
+      }
+
       const agentJson = await agentRes.json();
       console.log("Agent response:", agentJson);
 
       if (agentJson && agentJson.reply) {
         replyText = agentJson.reply;
+      } else {
+        console.warn("Agent response missing 'reply' field:", agentJson);
       }
     } catch (err) {
-      console.error("Error talking to agent:", err);
+      console.error("Error in /twilio/handle-gather:", err);
       replyText =
-        "I'm having trouble reaching the scheduling system right now. Please try again later.";
+        "I'm having trouble accessing the scheduling system right now. Please try again later.";
     }
   }
-
-  const vr = new VoiceResponse();
 
   // Speak the agent's reply
   vr.say(
