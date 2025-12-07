@@ -271,6 +271,7 @@ app.post("/debug/agent-chat", async (req, res) => {
             "x-book8-agent-key": profile.agentApiKey
           },
           body: JSON.stringify({
+            agentApiKey: profile.agentApiKey,
             date: args.date,
             timezone: args.timezone,
             durationMinutes: args.durationMinutes
@@ -295,6 +296,7 @@ app.post("/debug/agent-chat", async (req, res) => {
             "x-book8-agent-key": profile.agentApiKey
           },
           body: JSON.stringify({
+            agentApiKey: profile.agentApiKey,
             start: args.start,
             guestName: args.guestName,
             guestEmail: args.guestEmail,
