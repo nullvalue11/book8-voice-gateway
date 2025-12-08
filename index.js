@@ -38,6 +38,10 @@ const VOICE_AGENT_URL =
 
 const DEFAULT_HANDLE = process.env.DEFAULT_HANDLE || "waismofit";
 
+// TTS Voice configuration
+const DEFAULT_TTS_VOICE = process.env.TWILIO_TTS_VOICE || "Polly.Joanna-Neural";
+// Other nice options: "Polly.Matthew-Neural", "Polly.Joey-Neural", "Polly.Salli-Neural"
+
 // --- HOME PAGE ---
 app.get("/", (req, res) => {
   res.send(`
@@ -73,10 +77,10 @@ app.post("/twilio/voice", (req, res) => {
 
   gather.say(
     {
-      voice: "Polly.Joanna-Neural",
+      voice: DEFAULT_TTS_VOICE,
       language: "en-US"
     },
-    "Hi, this is Book Eight A I. How can I help you today?"
+    "You've reached Wais Mo Fitness. I'm your AI assistant. How can I help you today?"
   );
 
   // If nothing is said, loop back
@@ -143,12 +147,15 @@ app.post("/twilio/handle-gather", async (req, res) => {
   }
 
   // Speak the agent's reply
+  // You can also lightly clean the text if you want before reading it out
+  const spokenReply = replyText.trim();
+
   vr.say(
     {
-      voice: "Polly.Joanna-Neural",
+      voice: DEFAULT_TTS_VOICE,
       language: "en-US"
     },
-    replyText
+    spokenReply
   );
 
   // Ask if they want to continue (multi-turn)
@@ -162,7 +169,7 @@ app.post("/twilio/handle-gather", async (req, res) => {
 
   gather.say(
     {
-      voice: "Polly.Joanna-Neural",
+      voice: DEFAULT_TTS_VOICE,
       language: "en-US"
     },
     "You can ask another question, book another appointment, or say goodbye to end the call."
