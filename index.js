@@ -114,7 +114,7 @@ app.post("/twilio/handle-gather", async (req, res) => {
       const agentBody = {
         handle: "waismofit",
         message: speech,
-        callerPhone: from
+        callerPhone: req.body.From || null
       };
 
       const agentRes = await fetch(VOICE_AGENT_URL, {
