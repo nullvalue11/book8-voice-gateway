@@ -111,17 +111,16 @@ app.post("/twilio/handle-gather", async (req, res) => {
   if (speech && speech.trim().length > 0) {
     try {
       // ✅ IMPORTANT: tell the agent which business to use
+      const agentBody = {
+        handle: "waismofit",
+        message: speech,
+        callerPhone: from
+      };
+
       const agentRes = await fetch(VOICE_AGENT_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          handle: "waismofit",        // <—— hard-coded for now
-          message: speech,
-          // You can pass caller metadata if you want the agent to use it
-          meta: {
-            from
-          }
-        })
+        body: JSON.stringify(agentBody)
       });
 
       if (!agentRes.ok) {
