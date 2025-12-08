@@ -177,7 +177,7 @@ app.post("/twilio/handle-gather", async (req, res) => {
       voice: DEFAULT_TTS_VOICE,
       language: "en-US"
     },
-    "You can ask another question, book another appointment, or say goodbye to end the call."
+    `<speak><prosody rate="95%">You can ask another question, book another appointment, or say goodbye to end the call.</prosody></speak>`
   );
 
   res.type("text/xml");
