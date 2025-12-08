@@ -80,7 +80,7 @@ app.post("/twilio/voice", (req, res) => {
       voice: DEFAULT_TTS_VOICE,
       language: "en-US"
     },
-    "You've reached Wais Mo Fitness. I'm your AI assistant. How can I help you today?"
+    `<speak>Hi, this is Wais Mo Fitness. <break time="250ms"/> I'm your AI assistant. How can I help you today?</speak>`
   );
 
   // If nothing is said, loop back
@@ -147,8 +147,13 @@ app.post("/twilio/handle-gather", async (req, res) => {
   }
 
   // Speak the agent's reply
-  // You can also lightly clean the text if you want before reading it out
-  const spokenReply = replyText.trim();
+  // Clean the text and wrap in SSML for more natural delivery
+  const cleanedReply = replyText.trim();
+  const spokenReply = `<speak>
+  <prosody rate="95%">
+    ${cleanedReply}
+  </prosody>
+</speak>`;
 
   vr.say(
     {
