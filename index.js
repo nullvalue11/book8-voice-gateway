@@ -39,8 +39,25 @@ const VOICE_AGENT_URL =
 const DEFAULT_HANDLE = process.env.DEFAULT_HANDLE || "waismofit";
 
 // TTS Voice configuration
-const DEFAULT_TTS_VOICE = process.env.TWILIO_TTS_VOICE || "Polly.Joanna-Neural";
-// Other nice options: "Polly.Matthew-Neural", "Polly.Joey-Neural", "Polly.Salli-Neural"
+const DEFAULT_TTS_VOICE = process.env.TWILIO_TTS_VOICE || "Polly.Matthew-Neural";
+// Other nice options: "Polly.Joanna-Neural", "Polly.Kendra-Neural", "Polly.Joey-Neural", "Polly.Salli-Neural"
+
+// Helper: Clean and shorten text for phone conversations
+function toPhoneSentence(text) {
+  if (!text) return "Sorry, I didn't catch that. Could you repeat?";
+  
+  // Remove markdown artifacts just in case
+  let clean = text.replace(/\*\*/g, "").replace(/\n\n/g, ". ").replace(/\n/g, " ");
+
+  // Hard cap super-long replies
+  if (clean.length > 260) {
+    // Split on sentence boundaries and keep first 1–2 sentences
+    const parts = clean.split(/(?<=[.!?])\s+/);
+    clean = parts.slice(0, 2).join(" ");
+  }
+
+  return clean.trim();
+}
 
 // --- HOME PAGE ---
 app.get("/", (req, res) => {
@@ -147,11 +164,11 @@ app.post("/twilio/handle-gather", async (req, res) => {
   }
 
   // Speak the agent's reply
-  // Clean the text and wrap in SSML for more natural delivery
-  const cleanedReply = replyText.trim();
+  // Clean and shorten for phone conversation, then wrap in SSML for more natural delivery
+  const phoneReply = toPhoneSentence(replyText);
   const spokenReply = `<speak>
   <prosody rate="95%">
-    ${cleanedReply}
+    ${phoneReply}
   </prosody>
 </speak>`;
 
