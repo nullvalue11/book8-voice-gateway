@@ -5,6 +5,7 @@ import cors from "cors";
 import twilio from "twilio";
 import OpenAI from "openai";
 import { buildSystemPrompt, tools, getBusinessProfile } from "./agentConfig.js";
+import { getBusinessForCall } from "./businessConfig.js";
 
 dotenv.config();
 
@@ -88,6 +89,7 @@ app.post("/twilio/voice", (req, res) => {
   console.log("Incoming call from:", req.body.From);
 
   const vr = new VoiceResponse();
+  const biz = getBusinessForCall(req);
 
   // Gather caller speech and send it to /twilio/handle-gather
   // Use bargeIn=true so callers can interrupt the greeting
@@ -95,17 +97,18 @@ app.post("/twilio/voice", (req, res) => {
     input: "speech",
     action: "/twilio/handle-gather",
     method: "POST",
-    language: "en-US",
+    language: biz.language || "en-US",
     speechTimeout: "auto",
     bargeIn: true
   });
 
   gather.say(
     {
-      voice: DEFAULT_TTS_VOICE,
-      language: "en-US"
+      voice: biz.ttsVoice || DEFAULT_TTS_VOICE,
+      language: biz.language || "en-US"
     },
-    `<speak>Hi, this is Wais Mo Fitness. <break time="250ms"/> I'm your AI assistant. How can I help you today?</speak>`
+    // keep SSML breaks if you like
+    `<speak>${biz.greeting}</speak>`
   );
 
   // If nothing is said, loop back
@@ -131,6 +134,7 @@ app.post("/twilio/handle-gather", async (req, res) => {
     req.body.Body ||
     "";
   const from = req.body.From;
+  const biz = getBusinessForCall(req);   // <-- NEW
 
   console.log("Twilio SpeechResult:", speech, "from", from);
 
@@ -140,7 +144,7 @@ app.post("/twilio/handle-gather", async (req, res) => {
   if (speech && speech.trim().length > 0) {
     try {
       const agentBody = {
-        handle: "waismofit",
+        handle: biz.handle,        // <--- key change
         message: speech,
         callerPhone: from || null,
       };
@@ -183,7 +187,7 @@ app.post("/twilio/handle-gather", async (req, res) => {
     input: "speech",
     action: "/twilio/handle-gather",
     method: "POST",
-    language: "en-US",
+    language: biz.language || "en-US",
     speechTimeout: "auto",
     bargeIn: true, // 🔑 allow interruption on every turn
   });
@@ -191,8 +195,8 @@ app.post("/twilio/handle-gather", async (req, res) => {
   // Use SSML with breaks for more natural delivery
   gather.say(
     {
-      voice: DEFAULT_TTS_VOICE,
-      language: "en-US",
+      voice: biz.ttsVoice || DEFAULT_TTS_VOICE,
+      language: biz.language || "en-US",
     },
     `<speak>${trimmed}</speak>`
   );
