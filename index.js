@@ -44,16 +44,22 @@ const DEFAULT_TTS_VOICE = process.env.TWILIO_TTS_VOICE || "Polly.Matthew-Neural"
 
 // Helper: Clean and shorten text for phone conversations
 function toPhoneSentence(text) {
-  if (!text) return "Sorry, I didn't catch that. Could you repeat?";
-  
-  // Remove markdown artifacts just in case
-  let clean = text.replace(/\*\*/g, "").replace(/\n\n/g, ". ").replace(/\n/g, " ");
+  if (!text) {
+    return "Sorry, I didn't catch that. Could you say that again?";
+  }
 
-  // Hard cap super-long replies
-  if (clean.length > 260) {
-    // Split on sentence boundaries and keep first 1–2 sentences
-    const parts = clean.split(/(?<=[.!?])\s+/);
-    clean = parts.slice(0, 2).join(" ");
+  // Kill any markdown
+  let clean = text.replace(/\*\*/g, "").replace(/[_`]/g, "").replace(/\n\n/g, ". ").replace(/\n/g, " ");
+
+  // Split into sentences
+  const parts = clean.split(/(?<=[.!?])\s+/);
+
+  // Keep max 2 short sentences
+  clean = parts.slice(0, 2).join(" ");
+
+  // Hard cap length
+  if (clean.length > 220) {
+    clean = clean.slice(0, 220);
   }
 
   return clean.trim();
