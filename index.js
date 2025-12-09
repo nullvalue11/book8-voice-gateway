@@ -139,66 +139,63 @@ app.post("/twilio/handle-gather", async (req, res) => {
 
   if (speech && speech.trim().length > 0) {
     try {
-      // ✅ IMPORTANT: tell the agent which business to use
       const agentBody = {
         handle: "waismofit",
         message: speech,
-        callerPhone: req.body.From || null
+        callerPhone: from || null,
       };
 
       const agentRes = await fetch(VOICE_AGENT_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(agentBody)
+        body: JSON.stringify(agentBody),
       });
 
       if (!agentRes.ok) {
-        throw new Error(`Agent API returned ${agentRes.status}: ${agentRes.statusText}`);
-      }
-
-      const agentJson = await agentRes.json();
-      console.log("Agent response:", agentJson);
-
-      if (agentJson && agentJson.reply) {
-        replyText = agentJson.reply;
+        console.error(
+          "Agent API error:",
+          agentRes.status,
+          await agentRes.text()
+        );
+        replyText =
+          "I'm having trouble reaching the scheduling system right now. Please try again a bit later.";
       } else {
-        console.warn("Agent response missing 'reply' field:", agentJson);
+        const agentJson = await agentRes.json();
+        console.log("Agent response:", agentJson);
+        replyText =
+          (agentJson && agentJson.reply) ||
+          "Thanks. How else can I help you today?";
       }
     } catch (err) {
       console.error("Error in /twilio/handle-gather:", err);
       replyText =
-        "I'm having trouble accessing the scheduling system right now. Please try again later.";
+        "I'm having trouble reaching the scheduling system right now. Please try again a bit later.";
     }
   }
 
-  // Use <Gather> with bargeIn + nested <Say> so callers can interrupt
+  // --- Build next <Gather> with barge-in so the caller can interrupt ---
   const phoneReply = toPhoneSentence(replyText);
-  const spokenReply = `<speak>
-  <prosody rate="95%">
-    ${phoneReply}
-  </prosody>
-</speak>`;
-
-  // ✅ Use <Gather> with bargeIn + nested <Say>
+  
   const gather = vr.gather({
     input: "speech",
     action: "/twilio/handle-gather",
     method: "POST",
     language: "en-US",
     speechTimeout: "auto",
-    bargeIn: true          // <— this is the key: allows interruption
+    bargeIn: true, // 🔑 allow interruption on every turn
   });
 
+  // Keep SSML simple so it sounds more natural
   gather.say(
     {
       voice: DEFAULT_TTS_VOICE,
-      language: "en-US"
+      language: "en-US",
     },
-    spokenReply
+    `<speak>${phoneReply}</speak>`
   );
 
-  // Optional: if user doesn't say anything after this, you can end the call gracefully
-  // For now, we'll just let it timeout naturally
+  // If Twilio gets nothing, loop back to the main entry
+  vr.redirect("/twilio/voice");
 
   res.type("text/xml");
   res.send(vr.toString());
