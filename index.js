@@ -174,7 +174,10 @@ app.post("/twilio/handle-gather", async (req, res) => {
   }
 
   // --- Build next <Gather> with barge-in so the caller can interrupt ---
+  // Keep messages short: split into sentences and only say the first 1–2
   const phoneReply = toPhoneSentence(replyText);
+  const sentences = phoneReply.split(/(?<=[.!?])\s+/);
+  const trimmed = sentences.slice(0, 2).join(" ");
   
   const gather = vr.gather({
     input: "speech",
@@ -185,13 +188,13 @@ app.post("/twilio/handle-gather", async (req, res) => {
     bargeIn: true, // 🔑 allow interruption on every turn
   });
 
-  // Keep SSML simple so it sounds more natural
+  // Use SSML with breaks for more natural delivery
   gather.say(
     {
       voice: DEFAULT_TTS_VOICE,
       language: "en-US",
     },
-    `<speak>${phoneReply}</speak>`
+    `<speak>${trimmed}</speak>`
   );
 
   // If Twilio gets nothing, loop back to the main entry
