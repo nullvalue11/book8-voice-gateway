@@ -84,12 +84,14 @@ app.post("/twilio/voice", (req, res) => {
   const vr = new VoiceResponse();
 
   // Gather caller speech and send it to /twilio/handle-gather
+  // Use bargeIn=true so callers can interrupt the greeting
   const gather = vr.gather({
     input: "speech",
     action: "/twilio/handle-gather",
     method: "POST",
     language: "en-US",
-    speechTimeout: "auto"
+    speechTimeout: "auto",
+    bargeIn: true
   });
 
   gather.say(
@@ -163,8 +165,7 @@ app.post("/twilio/handle-gather", async (req, res) => {
     }
   }
 
-  // Speak the agent's reply
-  // Clean and shorten for phone conversation, then wrap in SSML for more natural delivery
+  // Use <Gather> with bargeIn + nested <Say> so callers can interrupt
   const phoneReply = toPhoneSentence(replyText);
   const spokenReply = `<speak>
   <prosody rate="95%">
@@ -172,21 +173,14 @@ app.post("/twilio/handle-gather", async (req, res) => {
   </prosody>
 </speak>`;
 
-  vr.say(
-    {
-      voice: DEFAULT_TTS_VOICE,
-      language: "en-US"
-    },
-    spokenReply
-  );
-
-  // Ask if they want to continue (multi-turn)
+  // ✅ Use <Gather> with bargeIn + nested <Say>
   const gather = vr.gather({
     input: "speech",
     action: "/twilio/handle-gather",
     method: "POST",
     language: "en-US",
-    speechTimeout: "auto"
+    speechTimeout: "auto",
+    bargeIn: true          // <— this is the key: allows interruption
   });
 
   gather.say(
@@ -194,8 +188,11 @@ app.post("/twilio/handle-gather", async (req, res) => {
       voice: DEFAULT_TTS_VOICE,
       language: "en-US"
     },
-    `<speak><prosody rate="95%">You can ask another question, book another appointment, or say goodbye to end the call.</prosody></speak>`
+    spokenReply
   );
+
+  // Optional: if user doesn't say anything after this, you can end the call gracefully
+  // For now, we'll just let it timeout naturally
 
   res.type("text/xml");
   res.send(vr.toString());
