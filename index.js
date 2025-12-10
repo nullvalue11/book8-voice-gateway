@@ -143,10 +143,14 @@ app.post("/twilio/handle-gather", async (req, res) => {
 
   if (speech && speech.trim().length > 0) {
     try {
+      // Get businessId from business config (handle)
+      const businessId = biz.handle;
+
       const agentBody = {
-        handle: biz.handle,        // <--- key change
+        handle: biz.handle,
+        businessId,          // <---- IMPORTANT
         message: speech,
-        callerPhone: from || null,
+        caller: from || null,
       };
 
       const agentRes = await fetch(VOICE_AGENT_URL, {
