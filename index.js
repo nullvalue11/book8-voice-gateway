@@ -150,7 +150,7 @@ app.post("/twilio/handle-gather", async (req, res) => {
         handle: biz.handle,
         businessId,          // <---- IMPORTANT
         message: speech,
-        caller: from || null,
+        callerPhone: from || null,
       };
 
       const agentRes = await fetch(VOICE_AGENT_URL, {
