@@ -154,13 +154,10 @@ app.post("/twilio/voice", async (req, res) => {
 // ---------------------------------------------------------------------
 //  Twilio speech handler: /twilio/handle-gather
 //  - Receives SpeechResult from Twilio
-//  - Sends it to the agent (/debug/agent-chat)
-//  - Speaks the agent's reply back to the caller
-//  - Starts another <Gather> for multi-turn conversation
+//  - Immediately responds with "thinking" message to reduce perceived lag
+//  - Redirects to /twilio/process-agent for actual processing
 // ---------------------------------------------------------------------
-app.post("/twilio/handle-gather", async (req, res) => {
-  const vr = new VoiceResponse();
-
+app.post("/twilio/handle-gather", (req, res) => {
   const speech =
     req.body.SpeechResult ||
     req.body.TranscriptionText ||
@@ -172,10 +169,55 @@ app.post("/twilio/handle-gather", async (req, res) => {
 
   console.log("Twilio SpeechResult:", speech, "from", from, "businessId", businessId);
 
+  const vr = new VoiceResponse();
+
+  // If no speech, redirect back to voice entry
+  if (!speech || speech.trim().length === 0) {
+    vr.redirect(`/twilio/voice?businessId=${encodeURIComponent(businessId)}`);
+    res.type("text/xml").send(vr.toString());
+    return;
+  }
+
+  // Immediately respond with "thinking" message to reduce perceived lag
+  // This makes the call feel much more responsive
+  vr.say(
+    {
+      voice: DEFAULT_TTS_VOICE,
+      language: "en-US"
+    },
+    "Sure — one second."
+  );
+
+  // Redirect to processing endpoint with all necessary params
+  const params = new URLSearchParams({
+    speech: speech,
+    from: from || "",
+    to: to || "",
+    businessId: businessId || ""
+  });
+
+  vr.redirect(`/twilio/process-agent?${params.toString()}`);
+  res.type("text/xml").send(vr.toString());
+});
+
+// ---------------------------------------------------------------------
+//  Twilio agent processor: /twilio/process-agent
+//  - Does the actual agent API call
+//  - Speaks the agent's reply back to the caller
+//  - Starts another <Gather> for multi-turn conversation
+// ---------------------------------------------------------------------
+app.get("/twilio/process-agent", async (req, res) => {
+  const vr = new VoiceResponse();
+
+  const speech = req.query.speech || "";
+  const from = req.query.from || "";
+  const to = req.query.to || "";
+  const businessId = req.query.businessId || "";
+
   let replyText =
     "I'm sorry, I didn't quite catch that. Could you please repeat what you need?";
 
-  if (speech && speech.trim().length > 0) {
+  if (speech && speech.trim().length > 0 && businessId) {
     try {
       const agentBody = {
         handle: businessId,          // keep existing contract
@@ -209,7 +251,7 @@ app.post("/twilio/handle-gather", async (req, res) => {
         }
       }
     } catch (err) {
-      console.error("Error in /twilio/handle-gather:", err);
+      console.error("Error in /twilio/process-agent:", err);
       replyText =
         "I'm having trouble accessing the scheduling system right now. Please try again a bit later.";
     }
