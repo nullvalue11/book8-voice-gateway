@@ -5,7 +5,6 @@ import cors from "cors";
 import twilio from "twilio";
 import OpenAI from "openai";
 import { buildSystemPrompt, tools, getBusinessProfile } from "./agentConfig.js";
-import { getBusinessForCall } from "./businessConfig.js";
 
 dotenv.config();
 
@@ -38,6 +37,20 @@ const VOICE_AGENT_URL =
   "https://book8-voice-gateway.onrender.com/debug/agent-chat";
 
 const DEFAULT_HANDLE = process.env.DEFAULT_HANDLE || "waismofit";
+
+// Business resolver from core API
+const BOOK8_CORE_API_URL = process.env.BOOK8_CORE_API_URL;
+
+async function resolveBusinessByTo(toPhone) {
+  if (!BOOK8_CORE_API_URL) return null;
+
+  const url = `${BOOK8_CORE_API_URL}/api/resolve?to=${encodeURIComponent(toPhone)}`;
+  const r = await fetch(url);
+  if (!r.ok) return null;
+
+  const json = await r.json();
+  return json?.business || null;
+}
 
 // TTS Voice configuration
 const DEFAULT_TTS_VOICE = process.env.TWILIO_TTS_VOICE || "Polly.Matthew-Neural";
@@ -85,37 +98,57 @@ app.get("/health", (req, res) => {
 //  - Greets the caller
 //  - Starts a <Gather> for speech
 // ---------------------------------------------------------------------
-app.post("/twilio/voice", (req, res) => {
-  console.log("Incoming call from:", req.body.From);
+app.post("/twilio/voice", async (req, res) => {
+  const to = req.body.To;     // Twilio number dialed (your shared number)
+  const from = req.body.From; // caller
+
+  console.log("Incoming call from:", from, "to:", to);
+
+  const business = await resolveBusinessByTo(to);
+
+  // If no business found, fail gracefully
+  if (!business) {
+    const vr = new VoiceResponse();
+    vr.say(
+      {
+        voice: DEFAULT_TTS_VOICE,
+        language: "en-US"
+      },
+      "This number is not yet configured for a business. Goodbye."
+    );
+    vr.hangup();
+    res.type("text/xml").send(vr.toString());
+    return;
+  }
+
+  // IMPORTANT: keep businessId in the query string for all future gathers
+  const businessId = business.id;
 
   const vr = new VoiceResponse();
-  const biz = getBusinessForCall(req);
-
-  // Gather caller speech and send it to /twilio/handle-gather
-  // Use bargeIn=true so callers can interrupt the greeting
   const gather = vr.gather({
     input: "speech",
-    action: "/twilio/handle-gather",
+    action: `/twilio/handle-gather?businessId=${encodeURIComponent(businessId)}`,
     method: "POST",
-    language: biz.language || "en-US",
+    language: "en-US",
     speechTimeout: "auto",
     bargeIn: true
   });
 
+  // Use business greeting if present
+  const greet =
+    business.greetingOverride ||
+    `Hi, thanks for calling ${business.name}. How can I help today?`;
+
   gather.say(
     {
-      voice: biz.ttsVoice || DEFAULT_TTS_VOICE,
-      language: biz.language || "en-US"
+      voice: DEFAULT_TTS_VOICE,
+      language: "en-US"
     },
-    // keep SSML breaks if you like
-    `<speak>${biz.greeting}</speak>`
+    greet
   );
 
-  // If nothing is said, loop back
-  vr.redirect("/twilio/voice");
-
-  res.type("text/xml");
-  res.send(vr.toString());
+  vr.redirect(`/twilio/voice?businessId=${encodeURIComponent(businessId)}`);
+  res.type("text/xml").send(vr.toString());
 });
 
 // ---------------------------------------------------------------------
@@ -134,23 +167,22 @@ app.post("/twilio/handle-gather", async (req, res) => {
     req.body.Body ||
     "";
   const from = req.body.From;
-  const biz = getBusinessForCall(req);   // <-- NEW
+  const to = req.body.To;
+  const businessId = req.query.businessId;
 
-  console.log("Twilio SpeechResult:", speech, "from", from);
+  console.log("Twilio SpeechResult:", speech, "from", from, "businessId", businessId);
 
   let replyText =
     "I'm sorry, I didn't quite catch that. Could you please repeat what you need?";
 
   if (speech && speech.trim().length > 0) {
     try {
-      // Get businessId from business config (handle)
-      const businessId = biz.handle;
-
       const agentBody = {
-        handle: biz.handle,
-        businessId,          // <---- IMPORTANT
+        handle: businessId,          // keep existing contract
+        businessId: businessId,      // explicit
         message: speech,
         callerPhone: from || null,
+        toPhone: to || null          // IMPORTANT for resolving later
       };
 
       const agentRes = await fetch(VOICE_AGENT_URL, {
@@ -166,18 +198,20 @@ app.post("/twilio/handle-gather", async (req, res) => {
           await agentRes.text()
         );
         replyText =
-          "I'm having trouble reaching the scheduling system right now. Please try again a bit later.";
+          "I'm having trouble accessing the scheduling system right now. Please try again a bit later.";
       } else {
         const agentJson = await agentRes.json();
         console.log("Agent response:", agentJson);
-        replyText =
-          (agentJson && agentJson.reply) ||
-          "Thanks. How else can I help you today?";
+        if (agentJson.ok && agentJson.reply) {
+          replyText = agentJson.reply;
+        } else {
+          replyText = (agentJson && agentJson.reply) || "Thanks. How else can I help you today?";
+        }
       }
     } catch (err) {
       console.error("Error in /twilio/handle-gather:", err);
       replyText =
-        "I'm having trouble reaching the scheduling system right now. Please try again a bit later.";
+        "I'm having trouble accessing the scheduling system right now. Please try again a bit later.";
     }
   }
 
@@ -189,9 +223,9 @@ app.post("/twilio/handle-gather", async (req, res) => {
   
   const gather = vr.gather({
     input: "speech",
-    action: "/twilio/handle-gather",
+    action: `/twilio/handle-gather?businessId=${encodeURIComponent(businessId)}`,
     method: "POST",
-    language: biz.language || "en-US",
+    language: "en-US",
     speechTimeout: "auto",
     bargeIn: true, // 🔑 allow interruption on every turn
   });
@@ -199,14 +233,14 @@ app.post("/twilio/handle-gather", async (req, res) => {
   // Use SSML with breaks for more natural delivery
   gather.say(
     {
-      voice: biz.ttsVoice || DEFAULT_TTS_VOICE,
-      language: biz.language || "en-US",
+      voice: DEFAULT_TTS_VOICE,
+      language: "en-US",
     },
     `<speak>${trimmed}</speak>`
   );
 
-  // If Twilio gets nothing, loop back to the main entry
-  vr.redirect("/twilio/voice");
+  // Keep conversation going with businessId
+  vr.redirect(`/twilio/voice?businessId=${encodeURIComponent(businessId)}`);
 
   res.type("text/xml");
   res.send(vr.toString());
