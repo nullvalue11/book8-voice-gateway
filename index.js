@@ -95,8 +95,10 @@ app.get("/health", (req, res) => {
 
 // ---------------------------------------------------------------------
 //  Twilio entrypoint: /twilio/voice
-//  - Greets the caller
-//  - Starts a <Gather> for speech
+//  - Reads req.body.To (Twilio number being called)
+//  - Calls core-api /api/resolve?to=${To} to get business
+//  - Sets businessId from response and carries it through query string
+//  - Greets the caller and starts a <Gather> for speech
 // ---------------------------------------------------------------------
 app.post("/twilio/voice", async (req, res) => {
   const to = req.body.To;     // Twilio number dialed (your shared number)
@@ -104,26 +106,50 @@ app.post("/twilio/voice", async (req, res) => {
 
   console.log("Incoming call from:", from, "to:", to);
 
-  const business = await resolveBusinessByTo(to);
+  // Check if businessId is already in query string (from redirects)
+  // If present, use it; otherwise resolve from phone number
+  let businessId = req.query.businessId;
+  let business = null;
 
-  // If no business found, fail gracefully
-  if (!business) {
-    const vr = new VoiceResponse();
-    vr.say(
-      {
-        voice: DEFAULT_TTS_VOICE,
-        language: "en-US"
-      },
-      "This number is not yet configured for a business. Goodbye."
-    );
-    vr.hangup();
-    res.type("text/xml").send(vr.toString());
-    return;
+  if (!businessId) {
+    // Read req.body.To and call core-api /api/resolve?to=${To}
+    business = await resolveBusinessByTo(to);
+
+    // If no business found, fail gracefully
+    if (!business) {
+      const vr = new VoiceResponse();
+      vr.say(
+        {
+          voice: DEFAULT_TTS_VOICE,
+          language: "en-US"
+        },
+        "This number is not yet configured for a business. Goodbye."
+      );
+      vr.hangup();
+      res.type("text/xml").send(vr.toString());
+      return;
+    }
+
+    // Set businessId from response (supports id, businessId, or handle fields)
+    businessId = business.id || business.businessId || business.handle;
+    
+    if (!businessId) {
+      console.error("Business resolved but no id/businessId/handle found:", business);
+      const vr = new VoiceResponse();
+      vr.say(
+        {
+          voice: DEFAULT_TTS_VOICE,
+          language: "en-US"
+        },
+        "There was an error configuring this number. Please contact support."
+      );
+      vr.hangup();
+      res.type("text/xml").send(vr.toString());
+      return;
+    }
   }
 
   // IMPORTANT: keep businessId in the query string for all future gathers
-  const businessId = business.id;
-
   const vr = new VoiceResponse();
   const gather = vr.gather({
     input: "speech",
@@ -134,10 +160,17 @@ app.post("/twilio/voice", async (req, res) => {
     bargeIn: true
   });
 
-  // Use business greeting if present
-  const greet =
-    business.greetingOverride ||
-    `Hi, thanks for calling ${business.name}. How can I help today?`;
+  // Use business greeting if we have business object, otherwise generic
+  let greet;
+  if (business) {
+    greet =
+      business.greetingOverride ||
+      business.greeting ||
+      `Hi, thanks for calling ${business.name || "us"}. How can I help today?`;
+  } else {
+    // If businessId was from query string, use generic greeting
+    greet = "Hi, thanks for calling. How can I help you today?";
+  }
 
   gather.say(
     {
