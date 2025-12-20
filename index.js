@@ -39,17 +39,27 @@ const VOICE_AGENT_URL =
 const DEFAULT_HANDLE = process.env.DEFAULT_HANDLE || "waismofit";
 
 // Business resolver from core API
-const BOOK8_CORE_API_URL = process.env.BOOK8_CORE_API_URL;
-
+// Route every call via core-api resolve
 async function resolveBusinessByTo(toPhone) {
-  if (!BOOK8_CORE_API_URL) return null;
+  if (!toPhone) return null;
 
-  const url = `${BOOK8_CORE_API_URL}/api/resolve?to=${encodeURIComponent(toPhone)}`;
-  const r = await fetch(url);
-  if (!r.ok) return null;
+  // Call: GET https://book8-core-api.onrender.com/api/resolve?to=${encodeURIComponent(To)}
+  const url = `https://book8-core-api.onrender.com/api/resolve?to=${encodeURIComponent(toPhone)}`;
+  
+  try {
+    const r = await fetch(url);
+    if (!r.ok) {
+      console.error(`Core API resolve failed: ${r.status} ${r.statusText}`);
+      return null;
+    }
 
-  const json = await r.json();
-  return json?.business || null;
+    const json = await r.json();
+    // Response format: { businessId }
+    return json?.businessId || null;
+  } catch (err) {
+    console.error("Error calling core-api resolve:", err);
+    return null;
+  }
 }
 
 // TTS Voice configuration
@@ -109,14 +119,14 @@ app.post("/twilio/voice", async (req, res) => {
   // Check if businessId is already in query string (from redirects)
   // If present, use it; otherwise resolve from phone number
   let businessId = req.query.businessId;
-  let business = null;
 
   if (!businessId) {
     // Read req.body.To and call core-api /api/resolve?to=${To}
-    business = await resolveBusinessByTo(to);
+    // Get { businessId } from response
+    businessId = await resolveBusinessByTo(to);
 
     // If no business found, fail gracefully
-    if (!business) {
+    if (!businessId) {
       const vr = new VoiceResponse();
       vr.say(
         {
@@ -124,24 +134,6 @@ app.post("/twilio/voice", async (req, res) => {
           language: "en-US"
         },
         "This number is not yet configured for a business. Goodbye."
-      );
-      vr.hangup();
-      res.type("text/xml").send(vr.toString());
-      return;
-    }
-
-    // Set businessId from response (supports id, businessId, or handle fields)
-    businessId = business.id || business.businessId || business.handle;
-    
-    if (!businessId) {
-      console.error("Business resolved but no id/businessId/handle found:", business);
-      const vr = new VoiceResponse();
-      vr.say(
-        {
-          voice: DEFAULT_TTS_VOICE,
-          language: "en-US"
-        },
-        "There was an error configuring this number. Please contact support."
       );
       vr.hangup();
       res.type("text/xml").send(vr.toString());
@@ -160,17 +152,8 @@ app.post("/twilio/voice", async (req, res) => {
     bargeIn: true
   });
 
-  // Use business greeting if we have business object, otherwise generic
-  let greet;
-  if (business) {
-    greet =
-      business.greetingOverride ||
-      business.greeting ||
-      `Hi, thanks for calling ${business.name || "us"}. How can I help today?`;
-  } else {
-    // If businessId was from query string, use generic greeting
-    greet = "Hi, thanks for calling. How can I help you today?";
-  }
+  // Use generic greeting (business details can be fetched later if needed)
+  const greet = "Hi, thanks for calling. How can I help you today?";
 
   gather.say(
     {
@@ -190,7 +173,7 @@ app.post("/twilio/voice", async (req, res) => {
 //  - Immediately responds with "thinking" message to reduce perceived lag
 //  - Redirects to /twilio/process-agent for actual processing
 // ---------------------------------------------------------------------
-app.post("/twilio/handle-gather", (req, res) => {
+app.post("/twilio/handle-gather", async (req, res) => {
   const speech =
     req.body.SpeechResult ||
     req.body.TranscriptionText ||
@@ -198,7 +181,13 @@ app.post("/twilio/handle-gather", (req, res) => {
     "";
   const from = req.body.From;
   const to = req.body.To;
-  const businessId = req.query.businessId;
+  let businessId = req.query.businessId;
+
+  // Keep using the passed businessId (don't re-resolve unless missing)
+  if (!businessId && to) {
+    console.log("businessId missing in handle-gather, re-resolving from to:", to);
+    businessId = await resolveBusinessByTo(to);
+  }
 
   console.log("Twilio SpeechResult:", speech, "from", from, "businessId", businessId);
 
@@ -206,7 +195,24 @@ app.post("/twilio/handle-gather", (req, res) => {
 
   // If no speech, redirect back to voice entry
   if (!speech || speech.trim().length === 0) {
-    vr.redirect(`/twilio/voice?businessId=${encodeURIComponent(businessId)}`);
+    const redirectUrl = businessId 
+      ? `/twilio/voice?businessId=${encodeURIComponent(businessId)}`
+      : "/twilio/voice";
+    vr.redirect(redirectUrl);
+    res.type("text/xml").send(vr.toString());
+    return;
+  }
+
+  // If still no businessId after re-resolution, fail gracefully
+  if (!businessId) {
+    vr.say(
+      {
+        voice: DEFAULT_TTS_VOICE,
+        language: "en-US"
+      },
+      "I'm sorry, I'm having trouble identifying your business. Please try calling again."
+    );
+    vr.hangup();
     res.type("text/xml").send(vr.toString());
     return;
   }
@@ -245,7 +251,13 @@ app.get("/twilio/process-agent", async (req, res) => {
   const speech = req.query.speech || "";
   const from = req.query.from || "";
   const to = req.query.to || "";
-  const businessId = req.query.businessId || "";
+  let businessId = req.query.businessId || "";
+
+  // Keep using the passed businessId (don't re-resolve unless missing)
+  if (!businessId && to) {
+    console.log("businessId missing in process-agent, re-resolving from to:", to);
+    businessId = await resolveBusinessByTo(to);
+  }
 
   let replyText =
     "I'm sorry, I didn't quite catch that. Could you please repeat what you need?";
@@ -288,6 +300,20 @@ app.get("/twilio/process-agent", async (req, res) => {
       replyText =
         "I'm having trouble accessing the scheduling system right now. Please try again a bit later.";
     }
+  }
+
+  // If still no businessId after re-resolution, fail gracefully
+  if (!businessId) {
+    vr.say(
+      {
+        voice: DEFAULT_TTS_VOICE,
+        language: "en-US"
+      },
+      "I'm sorry, I'm having trouble identifying your business. Please try calling again."
+    );
+    vr.hangup();
+    res.type("text/xml").send(vr.toString());
+    return;
   }
 
   // --- Build next <Gather> with barge-in so the caller can interrupt ---
