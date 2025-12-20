@@ -36,8 +36,6 @@ const VOICE_AGENT_URL =
   process.env.VOICE_AGENT_URL ||
   "https://book8-voice-gateway.onrender.com/debug/agent-chat";
 
-const DEFAULT_HANDLE = process.env.DEFAULT_HANDLE || "waismofit";
-
 // Business resolver from core API
 // Route every call via core-api resolve
 async function resolveBusinessByTo(toPhone) {
