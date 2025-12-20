@@ -320,15 +320,17 @@ app.get("/twilio/process-agent", async (req, res) => {
   if (speech && speech.trim().length > 0 && businessId) {
     try {
       // Send full message history (last ~12 messages) to agent for context
+      // This is the #1 fix for "flow is completely mixed" - agent sees full conversation
       const recentMessages = session.messages.slice(-12);
       
+      // Payload structure: messages[] + callSid every turn
+      // System prompt will be attached by the agent service
       const agentBody = {
-        handle: businessId,          // keep existing contract
-        businessId: businessId,      // explicit
-        messages: recentMessages,     // full conversation history
+        businessId: businessId,
+        callSid: callSid || null,
+        messages: recentMessages,  // Full conversation history (user + assistant turns)
         callerPhone: from || null,
-        toPhone: to || null,          // IMPORTANT for resolving later
-        callSid: callSid || null
+        toPhone: to || null
       };
 
       const agentRes = await fetch(VOICE_AGENT_URL, {
