@@ -87,6 +87,35 @@ function toPhoneSentence(text) {
   return clean.trim();
 }
 
+// --- SESSION STORE (stateful conversations) ---
+const sessions = new Map();
+const SESSION_TTL_MS = 20 * 60 * 1000; // 20 minutes
+
+function getSession(callSid) {
+  if (!callSid) return null;
+  if (!sessions.has(callSid)) {
+    sessions.set(callSid, { 
+      messages: [], 
+      lastActive: Date.now(), 
+      businessId: null 
+    });
+  }
+  const s = sessions.get(callSid);
+  s.lastActive = Date.now();
+  return s;
+}
+
+// Cleanup old sessions to prevent memory leaks
+setInterval(() => {
+  const now = Date.now();
+  for (const [sid, s] of sessions.entries()) {
+    if (now - s.lastActive > SESSION_TTL_MS) {
+      sessions.delete(sid);
+      console.log(`Cleaned up expired session: ${sid}`);
+    }
+  }
+}, 60 * 1000); // Run cleanup every minute
+
 // --- HOME PAGE ---
 app.get("/", (req, res) => {
   res.send(`
@@ -111,12 +140,16 @@ app.get("/health", (req, res) => {
 app.post("/twilio/voice", async (req, res) => {
   const to = req.body.To;     // Twilio number dialed (your shared number)
   const from = req.body.From; // caller
+  const callSid = req.body.CallSid; // Twilio call identifier
 
-  console.log("Incoming call from:", from, "to:", to);
+  console.log("Incoming call from:", from, "to:", to, "CallSid:", callSid);
+
+  // Get or create session for this call
+  const session = getSession(callSid);
 
   // Check if businessId is already in query string (from redirects)
   // If present, use it; otherwise resolve from phone number
-  let businessId = req.query.businessId;
+  let businessId = req.query.businessId || session.businessId;
 
   if (!businessId) {
     // Read req.body.To and call core-api /api/resolve?to=${To}
@@ -138,6 +171,9 @@ app.post("/twilio/voice", async (req, res) => {
       return;
     }
   }
+
+  // Store businessId in session
+  session.businessId = businessId;
 
   // IMPORTANT: keep businessId in the query string for all future gathers
   const vr = new VoiceResponse();
@@ -179,15 +215,22 @@ app.post("/twilio/handle-gather", async (req, res) => {
     "";
   const from = req.body.From;
   const to = req.body.To;
+  const callSid = req.body.CallSid; // Twilio call identifier
   let businessId = req.query.businessId;
 
+  // Get or create session for this call
+  const session = getSession(callSid);
+
   // Keep using the passed businessId (don't re-resolve unless missing)
-  if (!businessId && to) {
+  if (!businessId && session.businessId) {
+    businessId = session.businessId;
+  } else if (!businessId && to) {
     console.log("businessId missing in handle-gather, re-resolving from to:", to);
     businessId = await resolveBusinessByTo(to);
+    session.businessId = businessId;
   }
 
-  console.log("Twilio SpeechResult:", speech, "from", from, "businessId", businessId);
+  console.log("Twilio SpeechResult:", speech, "from", from, "businessId", businessId, "CallSid:", callSid);
 
   const vr = new VoiceResponse();
 
@@ -215,6 +258,12 @@ app.post("/twilio/handle-gather", async (req, res) => {
     return;
   }
 
+  // Store businessId in session
+  session.businessId = businessId;
+
+  // Add user message to session history
+  session.messages.push({ role: "user", content: speech });
+
   // Immediately respond with "thinking" message to reduce perceived lag
   // This makes the call feel much more responsive
   vr.say(
@@ -230,7 +279,8 @@ app.post("/twilio/handle-gather", async (req, res) => {
     speech: speech,
     from: from || "",
     to: to || "",
-    businessId: businessId || ""
+    businessId: businessId || "",
+    callSid: callSid || ""
   });
 
   vr.redirect(`/twilio/process-agent?${params.toString()}`);
@@ -249,12 +299,19 @@ app.get("/twilio/process-agent", async (req, res) => {
   const speech = req.query.speech || "";
   const from = req.query.from || "";
   const to = req.query.to || "";
+  const callSid = req.query.callSid || "";
   let businessId = req.query.businessId || "";
 
+  // Get session for this call
+  const session = getSession(callSid);
+
   // Keep using the passed businessId (don't re-resolve unless missing)
-  if (!businessId && to) {
+  if (!businessId && session.businessId) {
+    businessId = session.businessId;
+  } else if (!businessId && to) {
     console.log("businessId missing in process-agent, re-resolving from to:", to);
     businessId = await resolveBusinessByTo(to);
+    session.businessId = businessId;
   }
 
   let replyText =
@@ -262,12 +319,16 @@ app.get("/twilio/process-agent", async (req, res) => {
 
   if (speech && speech.trim().length > 0 && businessId) {
     try {
+      // Send full message history (last ~12 messages) to agent for context
+      const recentMessages = session.messages.slice(-12);
+      
       const agentBody = {
         handle: businessId,          // keep existing contract
         businessId: businessId,      // explicit
-        message: speech,
+        messages: recentMessages,     // full conversation history
         callerPhone: from || null,
-        toPhone: to || null          // IMPORTANT for resolving later
+        toPhone: to || null,          // IMPORTANT for resolving later
+        callSid: callSid || null
       };
 
       const agentRes = await fetch(VOICE_AGENT_URL, {
@@ -289,8 +350,13 @@ app.get("/twilio/process-agent", async (req, res) => {
         console.log("Agent response:", agentJson);
         if (agentJson.ok && agentJson.reply) {
           replyText = agentJson.reply;
+          // Add assistant reply to session history
+          session.messages.push({ role: "assistant", content: replyText });
         } else {
           replyText = (agentJson && agentJson.reply) || "Thanks. How else can I help you today?";
+          if (replyText) {
+            session.messages.push({ role: "assistant", content: replyText });
+          }
         }
       }
     } catch (err) {
@@ -348,17 +414,34 @@ app.get("/twilio/process-agent", async (req, res) => {
 // --- Simple debug endpoint to talk to the agent over HTTP (text only) ---
 app.post("/debug/agent-chat", async (req, res) => {
   try {
-    const { handle, message } = req.body || {};
+    const { handle, message, messages, businessId, callerPhone, toPhone, callSid } = req.body || {};
 
-    if (!handle || !message) {
+    // Support both single message (backward compat) and messages array (stateful)
+    let conversationMessages = [];
+    if (messages && Array.isArray(messages) && messages.length > 0) {
+      // Use provided messages array (stateful conversation)
+      conversationMessages = messages;
+    } else if (message) {
+      // Single message (backward compatibility)
+      conversationMessages = [{ role: "user", content: message }];
+    } else {
       return res.status(400).json({
         ok: false,
-        error: "Missing 'handle' or 'message' in request body"
+        error: "Missing 'message' or 'messages' in request body"
       });
     }
 
+    if (!handle && !businessId) {
+      return res.status(400).json({
+        ok: false,
+        error: "Missing 'handle' or 'businessId' in request body"
+      });
+    }
+
+    const businessHandle = handle || businessId;
+
     // 1) Get business profile & system instructions
-    const profile = await getBusinessProfile(handle);
+    const profile = await getBusinessProfile(businessHandle);
     const systemPrompt = buildSystemPrompt(profile);
 
     // 2) First call: ask the model what to do (with tools enabled)
@@ -369,10 +452,7 @@ app.post("/debug/agent-chat", async (req, res) => {
           role: "system",
           content: systemPrompt
         },
-        {
-          role: "user",
-          content: message
-        }
+        ...conversationMessages
       ],
       tools,                  // 👈 from agentConfig.js
       tool_choice: "auto"     // let it decide when to call tools
