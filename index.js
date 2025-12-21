@@ -13,6 +13,7 @@ const PORT = process.env.PORT || 10000;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const BOOK8_BASE_URL = process.env.BOOK8_BASE_URL || "https://book8-ai.vercel.app";
 const BOOK8_AGENT_API_KEY = process.env.BOOK8_AGENT_API_KEY; // will use later
+const CORE_API_BASE_URL = process.env.CORE_API_BASE_URL || "https://book8-core-api.onrender.com";
 
 if (!OPENAI_API_KEY) {
   console.warn("WARNING: OPENAI_API_KEY is not set. The agent will not work.");
@@ -41,8 +42,8 @@ const VOICE_AGENT_URL =
 async function resolveBusinessByTo(toPhone) {
   if (!toPhone) return null;
 
-  // Call: GET https://book8-core-api.onrender.com/api/resolve?to=${encodeURIComponent(To)}
-  const url = `https://book8-core-api.onrender.com/api/resolve?to=${encodeURIComponent(toPhone)}`;
+  // Call: GET {CORE_API_BASE_URL}/api/resolve?to=${encodeURIComponent(To)}
+  const url = `${CORE_API_BASE_URL}/api/resolve?to=${encodeURIComponent(toPhone)}`;
   
   try {
     const r = await fetch(url);
@@ -179,7 +180,7 @@ app.post("/twilio/voice", async (req, res) => {
   // Only call on first request (not redirects)
   if (!req.query.businessId && callSid) {
     try {
-      const coreApiUrl = "https://book8-core-api.onrender.com/internal/calls/start";
+      const coreApiUrl = `${CORE_API_BASE_URL}/internal/calls/start`;
       const startCallBody = {
         callSid: callSid,
         from: from,
@@ -795,7 +796,7 @@ app.post("/twilio/status-callback", async (req, res) => {
 
   // B) Call core-api /internal/calls/end with durationSeconds
   try {
-    const coreApiUrl = "https://book8-core-api.onrender.com/internal/calls/end";
+    const coreApiUrl = `${CORE_API_BASE_URL}/internal/calls/end`;
     const endCallBody = {
       callSid: CallSid,
       status: mappedStatus,  // Use mapped status (completed or failed)
