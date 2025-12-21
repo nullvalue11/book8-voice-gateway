@@ -724,19 +724,26 @@ app.post("/debug/agent-chat", async (req, res) => {
 
 // ---------------------------------------------------------------------
 //  Twilio Status Callback: /twilio/status-callback
-//  B) Add Twilio callback endpoint (mandatory)
-//  - Receives call status events from Twilio (completed, failed, etc.)
-//  - Parses Twilio payload: CallSid, CallStatus, CallDuration
-//  - Maps statuses: completed → completed, failed/busy/no-answer/canceled → failed
-//  - Calls core-api /internal/calls/end with durationSeconds
-//  - Mandatory for reliable call tracking (hangups/failures/timeouts)
+//  Step 2A - MANDATORY endpoint for reliable call tracking
 //  
-//  C) Twilio config: This endpoint must be configured in Twilio Console:
+//  Goal: Guarantee every call ends with /internal/calls/end, no matter how it dies.
+//  This solves: hangups, silent failures, gather timeouts, callers dropping mid-sentence.
+//  Without this, your data is lying to you.
+//
+//  What it does:
+//  1. Reads: CallSid, CallStatus, CallDuration (if present)
+//  2. Maps status:
+//     - completed → completed
+//     - busy | failed | no-answer | canceled → failed
+//  3. POSTs to: POST {CORE_API}/internal/calls/end
+//
+//  Twilio Configuration (REQUIRED):
 //  - Go to Phone Numbers > Manage > Active Numbers
 //  - Select your Twilio number
-//  - Under "Voice & Fax", set "Status Callback URL" to:
-//    https://book8-voice-gateway.onrender.com/twilio/status-callback
-//  - Set "Status Callback Events" to at least: "completed" (plus "answered" if you want "in_progress")
+//  - Under "Voice & Fax", set:
+//    - Status Callback URL: https://book8-voice-gateway.onrender.com/twilio/status-callback
+//    - Status Callback Events: At least "completed" (required)
+//    - Optional but nice: also "answered" (for in_progress tracking)
 // ---------------------------------------------------------------------
 app.post("/twilio/status-callback", async (req, res) => {
   const {
@@ -767,10 +774,16 @@ app.post("/twilio/status-callback", async (req, res) => {
     return;
   }
 
-  // Map statuses:
+  // Map statuses (as specified):
   // completed → completed
-  // failed/busy/no-answer/canceled → failed
-  let mappedStatus = CallStatus === "completed" ? "completed" : "failed";
+  // busy | failed | no-answer | canceled → failed
+  let mappedStatus;
+  if (CallStatus === "completed") {
+    mappedStatus = "completed";
+  } else {
+    // busy | failed | no-answer | canceled → failed
+    mappedStatus = "failed";
+  }
 
   // Parse CallDuration (if present; for completed it often is)
   // CallDuration is in seconds as a string
