@@ -175,8 +175,48 @@ app.post("/twilio/voice", async (req, res) => {
   // Store businessId in session
   session.businessId = businessId;
 
+  // A) On inbound call: Call core-api /internal/calls/start
+  // Only call on first request (not redirects)
+  if (!req.query.businessId && callSid) {
+    try {
+      const coreApiUrl = "https://book8-core-api.onrender.com/internal/calls/start";
+      const startCallBody = {
+        callSid: callSid,
+        from: from,
+        to: to,
+        businessId: businessId
+      };
+
+      const coreApiRes = await fetch(coreApiUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify(startCallBody)
+      });
+
+      if (!coreApiRes.ok) {
+        console.error(
+          "Core API /internal/calls/start error:",
+          coreApiRes.status,
+          await coreApiRes.text()
+        );
+      } else {
+        console.log("Successfully notified core-api of call start:", callSid);
+      }
+    } catch (err) {
+      console.error("Error calling core-api /internal/calls/start:", err);
+      // Don't fail the call if this fails
+    }
+  }
+
   // IMPORTANT: keep businessId in the query string for all future gathers
   const vr = new VoiceResponse();
+  
+  // C) Twilio config: StatusCallback URL should be configured in Twilio Console
+  // Go to Phone Numbers > Manage > Active Numbers > Your Number
+  // Set "Status Callback URL" to: https://book8-voice-gateway.onrender.com/twilio/status-callback
+  // Set "Status Callback Events" to at least: "completed" (plus "answered" if you want "in_progress")
   const gather = vr.gather({
     input: "speech",
     action: `/twilio/handle-gather?businessId=${encodeURIComponent(businessId)}`,
@@ -683,16 +723,19 @@ app.post("/debug/agent-chat", async (req, res) => {
 
 // ---------------------------------------------------------------------
 //  Twilio Status Callback: /twilio/status-callback
+//  B) Add Twilio callback endpoint (mandatory)
 //  - Receives call status events from Twilio (completed, failed, etc.)
-//  - Calls core-api /internal/calls/end when call ends
+//  - Parses Twilio payload: CallSid, CallStatus, CallDuration
+//  - Maps statuses: completed → completed, failed/busy/no-answer/canceled → failed
+//  - Calls core-api /internal/calls/end with durationSeconds
 //  - Mandatory for reliable call tracking (hangups/failures/timeouts)
 //  
-//  NOTE: This endpoint must be configured in Twilio Console:
+//  C) Twilio config: This endpoint must be configured in Twilio Console:
 //  - Go to Phone Numbers > Manage > Active Numbers
 //  - Select your Twilio number
 //  - Under "Voice & Fax", set "Status Callback URL" to:
 //    https://book8-voice-gateway.onrender.com/twilio/status-callback
-//  - Set "Status Callback Events" to at least: "completed"
+//  - Set "Status Callback Events" to at least: "completed" (plus "answered" if you want "in_progress")
 // ---------------------------------------------------------------------
 app.post("/twilio/status-callback", async (req, res) => {
   const {
@@ -713,6 +756,7 @@ app.post("/twilio/status-callback", async (req, res) => {
     CallDuration
   });
 
+  // B) Parse Twilio payload and map statuses
   // Only process end states (completed, failed, busy, no-answer, canceled)
   const endStates = ["completed", "failed", "busy", "no-answer", "canceled"];
   
@@ -720,6 +764,21 @@ app.post("/twilio/status-callback", async (req, res) => {
     // Not an end state, just acknowledge
     res.type("text/xml").send("<Response></Response>");
     return;
+  }
+
+  // Map statuses:
+  // completed → completed
+  // failed/busy/no-answer/canceled → failed
+  let mappedStatus = CallStatus === "completed" ? "completed" : "failed";
+
+  // Parse CallDuration (if present; for completed it often is)
+  // CallDuration is in seconds as a string
+  let durationSeconds = null;
+  if (CallDuration) {
+    durationSeconds = parseInt(CallDuration, 10);
+    if (isNaN(durationSeconds)) {
+      durationSeconds = null;
+    }
   }
 
   // Resolve businessId from To number
@@ -734,16 +793,16 @@ app.post("/twilio/status-callback", async (req, res) => {
     sessions.delete(CallSid);
   }
 
-  // Call core-api /internal/calls/end to track call completion
+  // B) Call core-api /internal/calls/end with durationSeconds
   try {
     const coreApiUrl = "https://book8-core-api.onrender.com/internal/calls/end";
     const endCallBody = {
       callSid: CallSid,
-      status: CallStatus,
+      status: mappedStatus,  // Use mapped status (completed or failed)
       from: From,
       to: To,
       businessId: businessId,
-      duration: CallDuration ? parseInt(CallDuration, 10) : null,
+      durationSeconds: durationSeconds,  // Duration in seconds
       direction: Direction,
       timestamp: Timestamp
     };
