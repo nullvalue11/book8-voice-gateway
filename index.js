@@ -681,6 +681,99 @@ app.post("/debug/agent-chat", async (req, res) => {
   }
 });
 
+// ---------------------------------------------------------------------
+//  Twilio Status Callback: /twilio/status-callback
+//  - Receives call status events from Twilio (completed, failed, etc.)
+//  - Calls core-api /internal/calls/end when call ends
+//  - Mandatory for reliable call tracking (hangups/failures/timeouts)
+//  
+//  NOTE: This endpoint must be configured in Twilio Console:
+//  - Go to Phone Numbers > Manage > Active Numbers
+//  - Select your Twilio number
+//  - Under "Voice & Fax", set "Status Callback URL" to:
+//    https://book8-voice-gateway.onrender.com/twilio/status-callback
+//  - Set "Status Callback Events" to at least: "completed"
+// ---------------------------------------------------------------------
+app.post("/twilio/status-callback", async (req, res) => {
+  const {
+    CallSid,
+    CallStatus,
+    From,
+    To,
+    CallDuration,
+    Direction,
+    Timestamp
+  } = req.body;
+
+  console.log("Twilio Status Callback:", {
+    CallSid,
+    CallStatus,
+    From,
+    To,
+    CallDuration
+  });
+
+  // Only process end states (completed, failed, busy, no-answer, canceled)
+  const endStates = ["completed", "failed", "busy", "no-answer", "canceled"];
+  
+  if (!endStates.includes(CallStatus)) {
+    // Not an end state, just acknowledge
+    res.type("text/xml").send("<Response></Response>");
+    return;
+  }
+
+  // Resolve businessId from To number
+  let businessId = null;
+  if (To) {
+    businessId = await resolveBusinessByTo(To);
+  }
+
+  // Clean up session when call ends
+  if (CallSid && sessions.has(CallSid)) {
+    console.log(`Cleaning up session for ended call: ${CallSid}`);
+    sessions.delete(CallSid);
+  }
+
+  // Call core-api /internal/calls/end to track call completion
+  try {
+    const coreApiUrl = "https://book8-core-api.onrender.com/internal/calls/end";
+    const endCallBody = {
+      callSid: CallSid,
+      status: CallStatus,
+      from: From,
+      to: To,
+      businessId: businessId,
+      duration: CallDuration ? parseInt(CallDuration, 10) : null,
+      direction: Direction,
+      timestamp: Timestamp
+    };
+
+    const coreApiRes = await fetch(coreApiUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(endCallBody)
+    });
+
+    if (!coreApiRes.ok) {
+      console.error(
+        "Core API /internal/calls/end error:",
+        coreApiRes.status,
+        await coreApiRes.text()
+      );
+    } else {
+      console.log("Successfully notified core-api of call end:", CallSid);
+    }
+  } catch (err) {
+    console.error("Error calling core-api /internal/calls/end:", err);
+    // Don't fail the callback - Twilio expects a response
+  }
+
+  // Always respond to Twilio (even if core-api call failed)
+  res.type("text/xml").send("<Response></Response>");
+});
+
 // --- 404 FALLBACK ---
 app.use((req, res) => {
   res.status(404).json({ ok: false, error: "Not found" });
