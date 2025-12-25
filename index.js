@@ -14,6 +14,7 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const BOOK8_BASE_URL = process.env.BOOK8_BASE_URL || "https://book8-ai.vercel.app";
 const BOOK8_AGENT_API_KEY = process.env.BOOK8_AGENT_API_KEY; // will use later
 const CORE_API_BASE_URL = process.env.CORE_API_BASE_URL || "https://book8-core-api.onrender.com";
+const CORE_API_INTERNAL_SECRET = process.env.CORE_API_INTERNAL_SECRET || process.env.INTERNAL_API_SECRET;
 
 if (!OPENAI_API_KEY) {
   console.warn("WARNING: OPENAI_API_KEY is not set. The agent will not work.");
@@ -191,7 +192,8 @@ app.post("/twilio/voice", async (req, res) => {
       const coreApiRes = await fetch(coreApiUrl, {
         method: "POST",
         headers: {
-          "Content-Type": "application/json"
+          "Content-Type": "application/json",
+          "x-book8-internal-secret": CORE_API_INTERNAL_SECRET
         },
         body: JSON.stringify(startCallBody)
       });
@@ -415,8 +417,8 @@ app.get("/twilio/process-agent", async (req, res) => {
     vr.say(
       {
         voice: DEFAULT_TTS_VOICE,
-        language: "en-US"
-      },
+      language: "en-US"
+    },
       "I'm sorry, I'm having trouble identifying your business. Please try calling again."
     );
     vr.hangup();
@@ -729,6 +731,9 @@ app.post("/debug/agent-chat", async (req, res) => {
 //  Goal: Guarantee every call ends with /internal/calls/end, no matter how it dies.
 //  This solves: hangups, silent failures, gather timeouts, callers dropping mid-sentence.
 //  Without this, your data is lying to you.
+//  
+//  CRITICAL FOR BILLING: Stripe billing is meaningless if usage isn't real.
+//  This endpoint ensures accurate call lifecycle tracking for billing/usage purposes.
 //
 //  What it does:
 //  1. Reads: CallSid, CallStatus, CallDuration (if present)
@@ -808,6 +813,8 @@ app.post("/twilio/status-callback", async (req, res) => {
   }
 
   // B) Call core-api /internal/calls/end with durationSeconds
+  // REQUIRED: This ensures accurate billing/usage tracking
+  // Stripe billing is meaningless if usage isn't real - this endpoint guarantees every call is tracked
   try {
     const coreApiUrl = `${CORE_API_BASE_URL}/internal/calls/end`;
     const endCallBody = {
@@ -824,7 +831,8 @@ app.post("/twilio/status-callback", async (req, res) => {
     const coreApiRes = await fetch(coreApiUrl, {
       method: "POST",
       headers: {
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
+        "x-book8-internal-secret": CORE_API_INTERNAL_SECRET
       },
       body: JSON.stringify(endCallBody)
     });
