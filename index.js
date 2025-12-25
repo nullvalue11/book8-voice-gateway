@@ -20,6 +20,10 @@ if (!OPENAI_API_KEY) {
   console.warn("WARNING: OPENAI_API_KEY is not set. The agent will not work.");
 }
 
+if (!CORE_API_INTERNAL_SECRET) {
+  console.warn("WARNING: CORE_API_INTERNAL_SECRET (or INTERNAL_API_SECRET) is not set. Core API internal endpoints will fail.");
+}
+
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
 // --- EXPRESS SETUP ---
@@ -189,12 +193,20 @@ app.post("/twilio/voice", async (req, res) => {
         businessId: businessId
       };
 
+      const headers = {
+        "Content-Type": "application/json"
+      };
+      
+      // Only add secret header if it's set
+      if (CORE_API_INTERNAL_SECRET) {
+        headers["x-book8-internal-secret"] = CORE_API_INTERNAL_SECRET;
+      } else {
+        console.error("ERROR: CORE_API_INTERNAL_SECRET is missing! Core API call will fail.");
+      }
+
       const coreApiRes = await fetch(coreApiUrl, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-book8-internal-secret": CORE_API_INTERNAL_SECRET
-        },
+        headers: headers,
         body: JSON.stringify(startCallBody)
       });
 
@@ -828,12 +840,20 @@ app.post("/twilio/status-callback", async (req, res) => {
       timestamp: Timestamp
     };
 
+    const headers = {
+      "Content-Type": "application/json"
+    };
+    
+    // Only add secret header if it's set
+    if (CORE_API_INTERNAL_SECRET) {
+      headers["x-book8-internal-secret"] = CORE_API_INTERNAL_SECRET;
+    } else {
+      console.error("ERROR: CORE_API_INTERNAL_SECRET is missing! Core API call will fail.");
+    }
+
     const coreApiRes = await fetch(coreApiUrl, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-book8-internal-secret": CORE_API_INTERNAL_SECRET
-      },
+      headers: headers,
       body: JSON.stringify(endCallBody)
     });
 
