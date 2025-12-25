@@ -22,6 +22,9 @@ if (!OPENAI_API_KEY) {
 
 if (!CORE_API_INTERNAL_SECRET) {
   console.warn("WARNING: CORE_API_INTERNAL_SECRET (or INTERNAL_API_SECRET) is not set. Core API internal endpoints will fail.");
+} else {
+  console.log("[STARTUP] CORE_API_INTERNAL_SECRET is set (length:", CORE_API_INTERNAL_SECRET.length, ")");
+  console.log("[STARTUP] CORE_API_BASE_URL:", CORE_API_BASE_URL);
 }
 
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
@@ -200,9 +203,13 @@ app.post("/twilio/voice", async (req, res) => {
       // Only add secret header if it's set
       if (CORE_API_INTERNAL_SECRET) {
         headers["x-book8-internal-secret"] = CORE_API_INTERNAL_SECRET;
+        console.log("[DEBUG] Calling /internal/calls/start with secret header (length:", CORE_API_INTERNAL_SECRET.length, ")");
       } else {
         console.error("ERROR: CORE_API_INTERNAL_SECRET is missing! Core API call will fail.");
       }
+
+      console.log("[DEBUG] Core API URL:", coreApiUrl);
+      console.log("[DEBUG] Request body:", JSON.stringify(startCallBody));
 
       const coreApiRes = await fetch(coreApiUrl, {
         method: "POST",
