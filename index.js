@@ -14,7 +14,8 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const BOOK8_BASE_URL = process.env.BOOK8_BASE_URL || "https://book8-ai.vercel.app";
 const BOOK8_AGENT_API_KEY = process.env.BOOK8_AGENT_API_KEY; // will use later
 const CORE_API_BASE_URL = process.env.CORE_API_BASE_URL || "https://book8-core-api.onrender.com";
-const CORE_API_INTERNAL_SECRET = process.env.CORE_API_INTERNAL_SECRET || process.env.INTERNAL_API_SECRET;
+// Trim whitespace to prevent copy/paste issues
+const CORE_API_INTERNAL_SECRET = (process.env.CORE_API_INTERNAL_SECRET || process.env.INTERNAL_API_SECRET)?.trim();
 
 if (!OPENAI_API_KEY) {
   console.warn("WARNING: OPENAI_API_KEY is not set. The agent will not work.");
@@ -23,7 +24,11 @@ if (!OPENAI_API_KEY) {
 if (!CORE_API_INTERNAL_SECRET) {
   console.warn("WARNING: CORE_API_INTERNAL_SECRET (or INTERNAL_API_SECRET) is not set. Core API internal endpoints will fail.");
 } else {
-  console.log("[STARTUP] CORE_API_INTERNAL_SECRET is set (length:", CORE_API_INTERNAL_SECRET.length, ")");
+  // Log first 4 and last 4 chars for verification (without exposing full secret)
+  const preview = CORE_API_INTERNAL_SECRET.length > 8 
+    ? `${CORE_API_INTERNAL_SECRET.substring(0, 4)}...${CORE_API_INTERNAL_SECRET.substring(CORE_API_INTERNAL_SECRET.length - 4)}`
+    : "***";
+  console.log("[STARTUP] CORE_API_INTERNAL_SECRET is set (length:", CORE_API_INTERNAL_SECRET.length, ", preview:", preview, ")");
   console.log("[STARTUP] CORE_API_BASE_URL:", CORE_API_BASE_URL);
 }
 
