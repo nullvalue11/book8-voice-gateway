@@ -209,11 +209,13 @@ app.post("/twilio/voice", async (req, res) => {
       if (CORE_API_INTERNAL_SECRET) {
         headers["x-book8-internal-secret"] = CORE_API_INTERNAL_SECRET;
         console.log("[DEBUG] Calling /internal/calls/start with secret header (length:", CORE_API_INTERNAL_SECRET.length, ")");
+        console.log("[DEBUG] Header name: x-book8-internal-secret");
       } else {
         console.error("ERROR: CORE_API_INTERNAL_SECRET is missing! Core API call will fail.");
       }
 
       console.log("[DEBUG] Core API URL:", coreApiUrl);
+      console.log("[DEBUG] Request headers:", JSON.stringify(Object.keys(headers)));
       console.log("[DEBUG] Request body:", JSON.stringify(startCallBody));
 
       const coreApiRes = await fetch(coreApiUrl, {
@@ -222,11 +224,16 @@ app.post("/twilio/voice", async (req, res) => {
         body: JSON.stringify(startCallBody)
       });
 
+      // Log response status and body (safe logging - limit body length)
+      const responseText = await coreApiRes.text();
+      console.log("[DEBUG] core-api /internal/calls/start status:", coreApiRes.status);
+      console.log("[DEBUG] core-api /internal/calls/start body:", responseText.slice(0, 500));
+
       if (!coreApiRes.ok) {
         console.error(
           "Core API /internal/calls/start error:",
           coreApiRes.status,
-          await coreApiRes.text()
+          responseText
         );
       } else {
         console.log("Successfully notified core-api of call start:", callSid);
@@ -882,9 +889,15 @@ app.post("/twilio/status-callback", async (req, res) => {
     // Only add secret header if it's set
     if (CORE_API_INTERNAL_SECRET) {
       headers["x-book8-internal-secret"] = CORE_API_INTERNAL_SECRET;
+      console.log("[DEBUG] Calling /internal/calls/end with secret header (length:", CORE_API_INTERNAL_SECRET.length, ")");
+      console.log("[DEBUG] Header name: x-book8-internal-secret");
     } else {
       console.error("ERROR: CORE_API_INTERNAL_SECRET is missing! Core API call will fail.");
     }
+
+    console.log("[DEBUG] Core API URL:", coreApiUrl);
+    console.log("[DEBUG] Request headers:", JSON.stringify(Object.keys(headers)));
+    console.log("[DEBUG] Request body:", JSON.stringify(endCallBody));
 
     const coreApiRes = await fetch(coreApiUrl, {
       method: "POST",
@@ -892,11 +905,16 @@ app.post("/twilio/status-callback", async (req, res) => {
       body: JSON.stringify(endCallBody)
     });
 
+    // Log response status and body (safe logging - limit body length)
+    const responseText = await coreApiRes.text();
+    console.log("[DEBUG] core-api /internal/calls/end status:", coreApiRes.status);
+    console.log("[DEBUG] core-api /internal/calls/end body:", responseText.slice(0, 500));
+
     if (!coreApiRes.ok) {
       console.error(
         "Core API /internal/calls/end error:",
         coreApiRes.status,
-        await coreApiRes.text()
+        responseText
       );
     } else {
       console.log("Successfully notified core-api of call end:", CallSid);
