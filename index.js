@@ -205,7 +205,9 @@ app.post("/twilio/voice", async (req, res) => {
         "Content-Type": "application/json"
       };
       
-      // Only add secret header if it's set
+      // CRITICAL: Core API strictly requires this exact header name: x-book8-internal-secret
+      // Do NOT use a different header name (authorization, x-internal-secret, etc.)
+      // Value must come from process.env.CORE_API_INTERNAL_SECRET
       if (CORE_API_INTERNAL_SECRET) {
         headers["x-book8-internal-secret"] = CORE_API_INTERNAL_SECRET;
         console.log("[DEBUG] Calling /internal/calls/start with secret header (length:", CORE_API_INTERNAL_SECRET.length, ")");
@@ -886,7 +888,9 @@ app.post("/twilio/status-callback", async (req, res) => {
       "Content-Type": "application/json"
     };
     
-    // Only add secret header if it's set
+    // CRITICAL: Core API strictly requires this exact header name: x-book8-internal-secret
+    // Do NOT use a different header name (authorization, x-internal-secret, etc.)
+    // Value must come from process.env.CORE_API_INTERNAL_SECRET
     if (CORE_API_INTERNAL_SECRET) {
       headers["x-book8-internal-secret"] = CORE_API_INTERNAL_SECRET;
       console.log("[DEBUG] Calling /internal/calls/end with secret header (length:", CORE_API_INTERNAL_SECRET.length, ")");
