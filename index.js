@@ -48,7 +48,7 @@ const VoiceResponse = Twiml.VoiceResponse;
 // Helper: where to send text to the agent
 const VOICE_AGENT_URL =
   process.env.VOICE_AGENT_URL ||
-  "https://book8-voice-agent.onrender.com/agent/chat";
+  "https://book8-voice-agent.onrender.com/api/agent-chat";
 
 // Business resolver from core API
 // Route every call via core-api resolve
