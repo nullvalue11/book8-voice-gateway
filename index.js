@@ -297,6 +297,9 @@ app.post("/twilio/handle-gather", async (req, res) => {
     session.businessId = businessId;
   }
 
+  console.log("[DEBUG] /twilio/handle-gather called");
+  console.log("[DEBUG] Speech received:", speech ? `"${speech.substring(0, 50)}..."` : "(empty)");
+  console.log("[DEBUG] From:", from, "To:", to, "CallSid:", callSid, "businessId:", businessId);
   console.log("Twilio SpeechResult:", speech, "from", from, "businessId", businessId, "CallSid:", callSid);
 
   const vr = new VoiceResponse();
@@ -361,6 +364,9 @@ app.post("/twilio/handle-gather", async (req, res) => {
 //  - Starts another <Gather> for multi-turn conversation
 // ---------------------------------------------------------------------
 app.get("/twilio/process-agent", async (req, res) => {
+  console.log("[DEBUG] /twilio/process-agent called");
+  console.log("[DEBUG] Query params:", JSON.stringify(req.query));
+  
   const vr = new VoiceResponse();
 
   const speech = req.query.speech || "";
@@ -368,6 +374,8 @@ app.get("/twilio/process-agent", async (req, res) => {
   const to = req.query.to || "";
   const callSid = req.query.callSid || "";
   let businessId = req.query.businessId || "";
+  
+  console.log("[DEBUG] Extracted - speech:", speech ? `"${speech.substring(0, 50)}..."` : "(empty)", "businessId:", businessId);
 
   // Get session for this call
   const session = getSession(callSid);
