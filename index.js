@@ -401,36 +401,51 @@ app.get("/twilio/process-agent", async (req, res) => {
         text: speech  // Also include current speech for backward compatibility
       };
 
+      console.log("[DEBUG] Calling agent at:", VOICE_AGENT_URL);
+      console.log("[DEBUG] Agent request body:", JSON.stringify(agentBody, null, 2));
+
       const agentRes = await fetch(VOICE_AGENT_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(agentBody),
       });
 
+      const responseText = await agentRes.text();
+      console.log("[DEBUG] Agent response status:", agentRes.status);
+      console.log("[DEBUG] Agent response body:", responseText);
+
       if (!agentRes.ok) {
         console.error(
           "Agent API error:",
           agentRes.status,
-          await agentRes.text()
+          responseText
         );
         replyText =
           "I'm having trouble accessing the scheduling system right now. Please try again a bit later.";
       } else {
-        const agentJson = await agentRes.json();
-        console.log("Agent response:", agentJson);
-        if (agentJson.ok && agentJson.reply) {
-          replyText = agentJson.reply;
-          // Add assistant reply to session history
-          session.messages.push({ role: "assistant", content: replyText });
-        } else {
-          replyText = (agentJson && agentJson.reply) || "Thanks. How else can I help you today?";
-          if (replyText) {
+        try {
+          const agentJson = JSON.parse(responseText);
+          console.log("Agent response (parsed):", agentJson);
+          if (agentJson.ok && agentJson.reply) {
+            replyText = agentJson.reply;
+            // Add assistant reply to session history
             session.messages.push({ role: "assistant", content: replyText });
+          } else {
+            replyText = (agentJson && agentJson.reply) || "Thanks. How else can I help you today?";
+            if (replyText) {
+              session.messages.push({ role: "assistant", content: replyText });
+            }
           }
+        } catch (parseErr) {
+          console.error("Error parsing agent JSON response:", parseErr);
+          console.error("Raw response was:", responseText);
+          replyText =
+            "I'm having trouble processing the response. Please try again.";
         }
       }
     } catch (err) {
       console.error("Error in /twilio/process-agent:", err);
+      console.error("Error stack:", err.stack);
       replyText =
         "I'm having trouble accessing the scheduling system right now. Please try again a bit later.";
     }
