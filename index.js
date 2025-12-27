@@ -46,9 +46,23 @@ const { twiml: Twiml } = twilio;
 const VoiceResponse = Twiml.VoiceResponse;
 
 // Helper: where to send text to the agent
-const VOICE_AGENT_URL =
-  process.env.VOICE_AGENT_URL ||
-  "https://book8-voice-agent.onrender.com/api/agent-chat";
+// Use VOICE_AGENT_BASE_URL (base URL without path) and construct full URL
+const VOICE_AGENT_BASE_URL = process.env.VOICE_AGENT_BASE_URL;
+
+if (!VOICE_AGENT_BASE_URL) {
+  console.error("[FATAL] VOICE_AGENT_BASE_URL environment variable is required!");
+  console.error("[FATAL] Please set VOICE_AGENT_BASE_URL to the base URL of the voice-agent service");
+  console.error("[FATAL] Example: https://book8-voice-agent-1.onrender.com");
+  process.exit(1);
+}
+
+// Construct full agent URL
+const VOICE_AGENT_URL = `${VOICE_AGENT_BASE_URL}/api/agent-chat`;
+
+// Log resolved URL at startup
+console.log("[STARTUP] Voice Agent Configuration:");
+console.log("[STARTUP]   VOICE_AGENT_BASE_URL:", VOICE_AGENT_BASE_URL);
+console.log("[STARTUP]   VOICE_AGENT_URL:", VOICE_AGENT_URL);
 
 // Business resolver from core API
 // Route every call via core-api resolve
