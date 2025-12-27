@@ -101,6 +101,104 @@ function toPhoneSentence(text) {
   return clean.trim();
 }
 
+// Helper: Safe agent call with timeout and comprehensive error handling
+// Returns { success: boolean, reply: string, error?: string }
+async function callAgentSafely(agentBody, callSid, businessId) {
+  const AGENT_TIMEOUT_MS = 10000; // 10 seconds
+  
+  try {
+    console.log("[AGENT] Calling voice-agent");
+    console.log("[AGENT] URL:", VOICE_AGENT_URL);
+    console.log("[AGENT] callSid:", callSid);
+    console.log("[AGENT] businessId:", businessId);
+    console.log("[AGENT] Request body:", JSON.stringify(agentBody, null, 2));
+
+    // Create AbortController for timeout
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), AGENT_TIMEOUT_MS);
+
+    try {
+      const agentRes = await fetch(VOICE_AGENT_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(agentBody),
+        signal: controller.signal
+      });
+
+      clearTimeout(timeoutId);
+
+      // Read response as text first (safer than .json() which can throw)
+      const responseText = await agentRes.text();
+      
+      console.log("[AGENT] Response status:", agentRes.status);
+      console.log("[AGENT] Response body (first 500 chars):", responseText.slice(0, 500));
+
+      if (!agentRes.ok) {
+        console.error("[AGENT] API error:", agentRes.status, responseText.slice(0, 500));
+        return {
+          success: false,
+          reply: "I'm having trouble accessing the scheduling system right now. Please try again a bit later.",
+          error: `Agent API returned ${agentRes.status}`
+        };
+      }
+
+      // Attempt JSON.parse with safe fallback
+      let agentJson;
+      try {
+        agentJson = JSON.parse(responseText);
+      } catch (parseErr) {
+        console.error("[AGENT] JSON parse error:", parseErr);
+        console.error("[AGENT] Raw response:", responseText.slice(0, 500));
+        return {
+          success: false,
+          reply: "I'm having trouble processing the response. Please try again.",
+          error: "Invalid JSON response"
+        };
+      }
+
+      console.log("[AGENT] Parsed response:", agentJson);
+
+      // Extract reply from response
+      let reply = null;
+      if (agentJson.ok && agentJson.reply) {
+        reply = agentJson.reply;
+      } else if (agentJson.reply) {
+        reply = agentJson.reply;
+      } else {
+        reply = "Thanks. How else can I help you today?";
+      }
+
+      return {
+        success: true,
+        reply: reply
+      };
+
+    } catch (fetchErr) {
+      clearTimeout(timeoutId);
+      
+      if (fetchErr.name === 'AbortError') {
+        console.error("[AGENT] Request timeout after", AGENT_TIMEOUT_MS, "ms");
+        return {
+          success: false,
+          reply: "I'm taking a bit longer than usual. Please hold on, or try again in a moment.",
+          error: "Request timeout"
+        };
+      }
+      
+      throw fetchErr; // Re-throw to outer catch
+    }
+
+  } catch (err) {
+    console.error("[AGENT] Fatal error calling agent:", err);
+    console.error("[AGENT] Error stack:", err.stack);
+    return {
+      success: false,
+      reply: "I'm having trouble connecting right now. Please try calling again in a moment.",
+      error: err.message || "Unknown error"
+    };
+  }
+}
+
 // --- SESSION STORE (stateful conversations) ---
 const sessions = new Map();
 const SESSION_TTL_MS = 20 * 60 * 1000; // 20 minutes
@@ -152,129 +250,147 @@ app.get("/health", (req, res) => {
 //  - Greets the caller and starts a <Gather> for speech
 // ---------------------------------------------------------------------
 app.post("/twilio/voice", async (req, res) => {
-  const to = req.body.To;     // Twilio number dialed (your shared number)
-  const from = req.body.From; // caller
-  const callSid = req.body.CallSid; // Twilio call identifier
+  // Wrap entire handler in try/catch to prevent any crashes
+  try {
+    const to = req.body.To;     // Twilio number dialed (your shared number)
+    const from = req.body.From; // caller
+    const callSid = req.body.CallSid; // Twilio call identifier
 
-  console.log("Incoming call from:", from, "to:", to, "CallSid:", callSid);
+    console.log("Incoming call from:", from, "to:", to, "CallSid:", callSid);
 
-  // Get or create session for this call
-  const session = getSession(callSid);
+    // Get or create session for this call
+    const session = getSession(callSid);
 
-  // Check if businessId is already in query string (from redirects)
-  // If present, use it; otherwise resolve from phone number
-  let businessId = req.query.businessId || session.businessId;
+    // Check if businessId is already in query string (from redirects)
+    // If present, use it; otherwise resolve from phone number
+    let businessId = req.query.businessId || session.businessId;
 
-  if (!businessId) {
-    // Read req.body.To and call core-api /api/resolve?to=${To}
-    // Get { businessId } from response
-    businessId = await resolveBusinessByTo(to);
-
-    // If no business found, fail gracefully
     if (!businessId) {
-      const vr = new VoiceResponse();
-      vr.say(
-        {
-          voice: DEFAULT_TTS_VOICE,
-          language: "en-US"
-        },
-        "This number is not yet configured for a business. Goodbye."
-      );
-      vr.hangup();
-      res.type("text/xml").send(vr.toString());
-      return;
-    }
-  }
+      // Read req.body.To and call core-api /api/resolve?to=${To}
+      // Get { businessId } from response
+      businessId = await resolveBusinessByTo(to);
 
-  // Store businessId in session
-  session.businessId = businessId;
-
-  // A) On inbound call: Call core-api /internal/calls/start
-  // Only call on first request (not redirects)
-  if (!req.query.businessId && callSid) {
-    try {
-      const coreApiUrl = `${CORE_API_BASE_URL}/internal/calls/start`;
-      const startCallBody = {
-        callSid: callSid,
-        from: from,
-        to: to,
-        businessId: businessId
-      };
-
-      const headers = {
-        "Content-Type": "application/json"
-      };
-      
-      // CRITICAL: Core API strictly requires this exact header name: x-book8-internal-secret
-      // Do NOT use a different header name (authorization, x-internal-secret, etc.)
-      // Value must come from process.env.CORE_API_INTERNAL_SECRET
-      if (CORE_API_INTERNAL_SECRET) {
-        headers["x-book8-internal-secret"] = CORE_API_INTERNAL_SECRET;
-        console.log("[DEBUG] Calling /internal/calls/start with secret header (length:", CORE_API_INTERNAL_SECRET.length, ")");
-        console.log("[DEBUG] Header name: x-book8-internal-secret");
-      } else {
-        console.error("ERROR: CORE_API_INTERNAL_SECRET is missing! Core API call will fail.");
-      }
-
-      console.log("[DEBUG] Core API URL:", coreApiUrl);
-      console.log("[DEBUG] Request headers:", JSON.stringify(Object.keys(headers)));
-      console.log("[DEBUG] Request body:", JSON.stringify(startCallBody));
-
-      const coreApiRes = await fetch(coreApiUrl, {
-        method: "POST",
-        headers: headers,
-        body: JSON.stringify(startCallBody)
-      });
-
-      // Log response status and body (safe logging - limit body length)
-      const responseText = await coreApiRes.text();
-      console.log("[DEBUG] core-api /internal/calls/start status:", coreApiRes.status);
-      console.log("[DEBUG] core-api /internal/calls/start body:", responseText.slice(0, 500));
-
-      if (!coreApiRes.ok) {
-        console.error(
-          "Core API /internal/calls/start error:",
-          coreApiRes.status,
-          responseText
+      // If no business found, fail gracefully
+      if (!businessId) {
+        const vr = new VoiceResponse();
+        vr.say(
+          {
+            voice: DEFAULT_TTS_VOICE,
+            language: "en-US"
+          },
+          "This number is not yet configured for a business. Goodbye."
         );
-      } else {
-        console.log("Successfully notified core-api of call start:", callSid);
+        vr.hangup();
+        res.type("text/xml").send(vr.toString());
+        return;
       }
-    } catch (err) {
-      console.error("Error calling core-api /internal/calls/start:", err);
-      // Don't fail the call if this fails
     }
+
+    // Store businessId in session
+    session.businessId = businessId;
+
+    // A) On inbound call: Call core-api /internal/calls/start
+    // Only call on first request (not redirects)
+    if (!req.query.businessId && callSid) {
+      try {
+        const coreApiUrl = `${CORE_API_BASE_URL}/internal/calls/start`;
+        const startCallBody = {
+          callSid: callSid,
+          from: from,
+          to: to,
+          businessId: businessId
+        };
+
+        const headers = {
+          "Content-Type": "application/json"
+        };
+        
+        // CRITICAL: Core API strictly requires this exact header name: x-book8-internal-secret
+        // Do NOT use a different header name (authorization, x-internal-secret, etc.)
+        // Value must come from process.env.CORE_API_INTERNAL_SECRET
+        if (CORE_API_INTERNAL_SECRET) {
+          headers["x-book8-internal-secret"] = CORE_API_INTERNAL_SECRET;
+          console.log("[DEBUG] Calling /internal/calls/start with secret header (length:", CORE_API_INTERNAL_SECRET.length, ")");
+          console.log("[DEBUG] Header name: x-book8-internal-secret");
+        } else {
+          console.error("ERROR: CORE_API_INTERNAL_SECRET is missing! Core API call will fail.");
+        }
+
+        console.log("[DEBUG] Core API URL:", coreApiUrl);
+        console.log("[DEBUG] Request headers:", JSON.stringify(Object.keys(headers)));
+        console.log("[DEBUG] Request body:", JSON.stringify(startCallBody));
+
+        const coreApiRes = await fetch(coreApiUrl, {
+          method: "POST",
+          headers: headers,
+          body: JSON.stringify(startCallBody)
+        });
+
+        // Log response status and body (safe logging - limit body length)
+        const responseText = await coreApiRes.text();
+        console.log("[DEBUG] core-api /internal/calls/start status:", coreApiRes.status);
+        console.log("[DEBUG] core-api /internal/calls/start body:", responseText.slice(0, 500));
+
+        if (!coreApiRes.ok) {
+          console.error(
+            "Core API /internal/calls/start error:",
+            coreApiRes.status,
+            responseText
+          );
+        } else {
+          console.log("Successfully notified core-api of call start:", callSid);
+        }
+      } catch (err) {
+        console.error("Error calling core-api /internal/calls/start:", err);
+        // Don't fail the call if this fails
+      }
+    }
+
+    // IMPORTANT: keep businessId in the query string for all future gathers
+    const vr = new VoiceResponse();
+    
+    // C) Twilio config: StatusCallback URL should be configured in Twilio Console
+    // Go to Phone Numbers > Manage > Active Numbers > Your Number
+    // Set "Status Callback URL" to: https://book8-voice-gateway.onrender.com/twilio/status-callback
+    // Set "Status Callback Events" to at least: "completed" (plus "answered" if you want "in_progress")
+    const gather = vr.gather({
+      input: "speech",
+      action: `/twilio/handle-gather?businessId=${encodeURIComponent(businessId)}`,
+      method: "POST",
+      language: "en-US",
+      speechTimeout: "auto",
+      bargeIn: true
+    });
+
+    // Use generic greeting (business details can be fetched later if needed)
+    const greet = "Hi, thanks for calling. How can I help you today?";
+
+    gather.say(
+      {
+        voice: DEFAULT_TTS_VOICE,
+        language: "en-US"
+      },
+      greet
+    );
+
+    vr.redirect(`/twilio/voice?businessId=${encodeURIComponent(businessId)}`);
+    res.type("text/xml").send(vr.toString());
+  } catch (err) {
+    // CRITICAL: Never throw - always return valid TwiML
+    console.error("[FATAL] Error in /twilio/voice:", err);
+    console.error("[FATAL] Error stack:", err.stack);
+    
+    const vr = new VoiceResponse();
+    vr.say(
+      {
+        voice: DEFAULT_TTS_VOICE,
+        language: "en-US"
+      },
+      "I'm sorry, I'm experiencing a technical issue. Please try calling again in a moment."
+    );
+    vr.hangup();
+    res.type("text/xml").send(vr.toString());
   }
-
-  // IMPORTANT: keep businessId in the query string for all future gathers
-  const vr = new VoiceResponse();
-  
-  // C) Twilio config: StatusCallback URL should be configured in Twilio Console
-  // Go to Phone Numbers > Manage > Active Numbers > Your Number
-  // Set "Status Callback URL" to: https://book8-voice-gateway.onrender.com/twilio/status-callback
-  // Set "Status Callback Events" to at least: "completed" (plus "answered" if you want "in_progress")
-  const gather = vr.gather({
-    input: "speech",
-    action: `/twilio/handle-gather?businessId=${encodeURIComponent(businessId)}`,
-    method: "POST",
-    language: "en-US",
-    speechTimeout: "auto",
-    bargeIn: true
-  });
-
-  // Use generic greeting (business details can be fetched later if needed)
-  const greet = "Hi, thanks for calling. How can I help you today?";
-
-  gather.say(
-    {
-      voice: DEFAULT_TTS_VOICE,
-      language: "en-US"
-    },
-    greet
-  );
-
-  vr.redirect(`/twilio/voice?businessId=${encodeURIComponent(businessId)}`);
-  res.type("text/xml").send(vr.toString());
 });
 
 // ---------------------------------------------------------------------
@@ -284,86 +400,104 @@ app.post("/twilio/voice", async (req, res) => {
 //  - Redirects to /twilio/process-agent for actual processing
 // ---------------------------------------------------------------------
 app.post("/twilio/handle-gather", async (req, res) => {
-  const speech =
-    req.body.SpeechResult ||
-    req.body.TranscriptionText ||
-    req.body.Body ||
-    "";
-  const from = req.body.From;
-  const to = req.body.To;
-  const callSid = req.body.CallSid; // Twilio call identifier
-  let businessId = req.query.businessId;
+  // Wrap entire handler in try/catch to prevent any crashes
+  try {
+    const speech =
+      req.body.SpeechResult ||
+      req.body.TranscriptionText ||
+      req.body.Body ||
+      "";
+    const from = req.body.From;
+    const to = req.body.To;
+    const callSid = req.body.CallSid; // Twilio call identifier
+    let businessId = req.query.businessId;
 
-  // Get or create session for this call
-  const session = getSession(callSid);
+    // Get or create session for this call
+    const session = getSession(callSid);
 
-  // Keep using the passed businessId (don't re-resolve unless missing)
-  if (!businessId && session.businessId) {
-    businessId = session.businessId;
-  } else if (!businessId && to) {
-    console.log("businessId missing in handle-gather, re-resolving from to:", to);
-    businessId = await resolveBusinessByTo(to);
+    // Keep using the passed businessId (don't re-resolve unless missing)
+    if (!businessId && session.businessId) {
+      businessId = session.businessId;
+    } else if (!businessId && to) {
+      console.log("businessId missing in handle-gather, re-resolving from to:", to);
+      businessId = await resolveBusinessByTo(to);
+      session.businessId = businessId;
+    }
+
+    console.log("[DEBUG] /twilio/handle-gather called");
+    console.log("[DEBUG] Speech received:", speech ? `"${speech.substring(0, 50)}..."` : "(empty)");
+    console.log("[DEBUG] From:", from, "To:", to, "CallSid:", callSid, "businessId:", businessId);
+    console.log("Twilio SpeechResult:", speech, "from", from, "businessId", businessId, "CallSid:", callSid);
+
+    const vr = new VoiceResponse();
+
+    // If no speech, redirect back to voice entry
+    if (!speech || speech.trim().length === 0) {
+      const redirectUrl = businessId 
+        ? `/twilio/voice?businessId=${encodeURIComponent(businessId)}`
+        : "/twilio/voice";
+      vr.redirect(redirectUrl);
+      res.type("text/xml").send(vr.toString());
+      return;
+    }
+
+    // If still no businessId after re-resolution, fail gracefully
+    if (!businessId) {
+      vr.say(
+        {
+          voice: DEFAULT_TTS_VOICE,
+          language: "en-US"
+        },
+        "I'm sorry, I'm having trouble identifying your business. Please try calling again."
+      );
+      vr.hangup();
+      res.type("text/xml").send(vr.toString());
+      return;
+    }
+
+    // Store businessId in session
     session.businessId = businessId;
-  }
 
-  console.log("[DEBUG] /twilio/handle-gather called");
-  console.log("[DEBUG] Speech received:", speech ? `"${speech.substring(0, 50)}..."` : "(empty)");
-  console.log("[DEBUG] From:", from, "To:", to, "CallSid:", callSid, "businessId:", businessId);
-  console.log("Twilio SpeechResult:", speech, "from", from, "businessId", businessId, "CallSid:", callSid);
+    // Add user message to session history
+    session.messages.push({ role: "user", content: speech });
 
-  const vr = new VoiceResponse();
-
-  // If no speech, redirect back to voice entry
-  if (!speech || speech.trim().length === 0) {
-    const redirectUrl = businessId 
-      ? `/twilio/voice?businessId=${encodeURIComponent(businessId)}`
-      : "/twilio/voice";
-    vr.redirect(redirectUrl);
-    res.type("text/xml").send(vr.toString());
-    return;
-  }
-
-  // If still no businessId after re-resolution, fail gracefully
-  if (!businessId) {
+    // Immediately respond with "thinking" message to reduce perceived lag
+    // This makes the call feel much more responsive
     vr.say(
       {
         voice: DEFAULT_TTS_VOICE,
         language: "en-US"
       },
-      "I'm sorry, I'm having trouble identifying your business. Please try calling again."
+      "Sure — one second."
+    );
+
+    // Redirect to processing endpoint with all necessary params
+    const params = new URLSearchParams({
+      speech: speech,
+      from: from || "",
+      to: to || "",
+      businessId: businessId || "",
+      callSid: callSid || ""
+    });
+
+    vr.redirect(`/twilio/process-agent?${params.toString()}`);
+    res.type("text/xml").send(vr.toString());
+  } catch (err) {
+    // CRITICAL: Never throw - always return valid TwiML
+    console.error("[FATAL] Error in /twilio/handle-gather:", err);
+    console.error("[FATAL] Error stack:", err.stack);
+    
+    const vr = new VoiceResponse();
+    vr.say(
+      {
+        voice: DEFAULT_TTS_VOICE,
+        language: "en-US"
+      },
+      "I'm sorry, I'm experiencing a technical issue. Please try calling again in a moment."
     );
     vr.hangup();
     res.type("text/xml").send(vr.toString());
-    return;
   }
-
-  // Store businessId in session
-  session.businessId = businessId;
-
-  // Add user message to session history
-  session.messages.push({ role: "user", content: speech });
-
-  // Immediately respond with "thinking" message to reduce perceived lag
-  // This makes the call feel much more responsive
-  vr.say(
-    {
-      voice: DEFAULT_TTS_VOICE,
-      language: "en-US"
-    },
-    "Sure — one second."
-  );
-
-  // Redirect to processing endpoint with all necessary params
-  const params = new URLSearchParams({
-    speech: speech,
-    from: from || "",
-    to: to || "",
-    businessId: businessId || "",
-    callSid: callSid || ""
-  });
-
-  vr.redirect(`/twilio/process-agent?${params.toString()}`);
-  res.type("text/xml").send(vr.toString());
 });
 
 // ---------------------------------------------------------------------
@@ -373,36 +507,51 @@ app.post("/twilio/handle-gather", async (req, res) => {
 //  - Starts another <Gather> for multi-turn conversation
 // ---------------------------------------------------------------------
 app.get("/twilio/process-agent", async (req, res) => {
-  console.log("[DEBUG] /twilio/process-agent called");
-  console.log("[DEBUG] Query params:", JSON.stringify(req.query));
-  
-  const vr = new VoiceResponse();
+  // Wrap entire handler in try/catch to prevent any crashes
+  try {
+    console.log("[DEBUG] /twilio/process-agent called");
+    console.log("[DEBUG] Query params:", JSON.stringify(req.query));
+    
+    const vr = new VoiceResponse();
 
-  const speech = req.query.speech || "";
-  const from = req.query.from || "";
-  const to = req.query.to || "";
-  const callSid = req.query.callSid || "";
-  let businessId = req.query.businessId || "";
-  
-  console.log("[DEBUG] Extracted - speech:", speech ? `"${speech.substring(0, 50)}..."` : "(empty)", "businessId:", businessId);
+    const speech = req.query.speech || "";
+    const from = req.query.from || "";
+    const to = req.query.to || "";
+    const callSid = req.query.callSid || "";
+    let businessId = req.query.businessId || "";
+    
+    console.log("[DEBUG] Extracted - speech:", speech ? `"${speech.substring(0, 50)}..."` : "(empty)", "businessId:", businessId);
 
-  // Get session for this call
-  const session = getSession(callSid);
+    // Get session for this call
+    const session = getSession(callSid);
 
-  // Keep using the passed businessId (don't re-resolve unless missing)
-  if (!businessId && session.businessId) {
-    businessId = session.businessId;
-  } else if (!businessId && to) {
-    console.log("businessId missing in process-agent, re-resolving from to:", to);
-    businessId = await resolveBusinessByTo(to);
-    session.businessId = businessId;
-  }
+    // Keep using the passed businessId (don't re-resolve unless missing)
+    if (!businessId && session.businessId) {
+      businessId = session.businessId;
+    } else if (!businessId && to) {
+      console.log("businessId missing in process-agent, re-resolving from to:", to);
+      businessId = await resolveBusinessByTo(to);
+      session.businessId = businessId;
+    }
 
-  let replyText =
-    "I'm sorry, I didn't quite catch that. Could you please repeat what you need?";
+    let replyText =
+      "I'm sorry, I didn't quite catch that. Could you please repeat what you need?";
 
-  if (speech && speech.trim().length > 0 && businessId) {
-    try {
+    // If still no businessId after re-resolution, fail gracefully
+    if (!businessId) {
+      vr.say(
+        {
+          voice: DEFAULT_TTS_VOICE,
+          language: "en-US"
+        },
+        "I'm sorry, I'm having trouble identifying your business. Please try calling again."
+      );
+      vr.hangup();
+      res.type("text/xml").send(vr.toString());
+      return;
+    }
+
+    if (speech && speech.trim().length > 0 && businessId) {
       // Send full message history (last ~12 messages) to agent for context
       // This is the #1 fix for "flow is completely mixed" - agent sees full conversation
       const recentMessages = session.messages.slice(-12);
@@ -418,99 +567,65 @@ app.get("/twilio/process-agent", async (req, res) => {
         text: speech  // Also include current speech for backward compatibility
       };
 
-      console.log("[DEBUG] Calling agent at:", VOICE_AGENT_URL);
-      console.log("[DEBUG] Agent request body:", JSON.stringify(agentBody, null, 2));
-
-      const agentRes = await fetch(VOICE_AGENT_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(agentBody),
-      });
-
-      const responseText = await agentRes.text();
-      console.log("[DEBUG] Agent response status:", agentRes.status);
-      console.log("[DEBUG] Agent response body:", responseText);
-
-      if (!agentRes.ok) {
-        console.error(
-          "Agent API error:",
-          agentRes.status,
-          responseText
-        );
-        replyText =
-          "I'm having trouble accessing the scheduling system right now. Please try again a bit later.";
+      // Use safe agent call helper with timeout and comprehensive error handling
+      const agentResult = await callAgentSafely(agentBody, callSid, businessId);
+      
+      if (agentResult.success) {
+        replyText = agentResult.reply;
+        // Add assistant reply to session history
+        session.messages.push({ role: "assistant", content: replyText });
       } else {
-        try {
-          const agentJson = JSON.parse(responseText);
-          console.log("Agent response (parsed):", agentJson);
-          if (agentJson.ok && agentJson.reply) {
-            replyText = agentJson.reply;
-            // Add assistant reply to session history
-            session.messages.push({ role: "assistant", content: replyText });
-          } else {
-            replyText = (agentJson && agentJson.reply) || "Thanks. How else can I help you today?";
-            if (replyText) {
-              session.messages.push({ role: "assistant", content: replyText });
-            }
-          }
-        } catch (parseErr) {
-          console.error("Error parsing agent JSON response:", parseErr);
-          console.error("Raw response was:", responseText);
-          replyText =
-            "I'm having trouble processing the response. Please try again.";
-        }
+        // Use the fallback reply from the helper
+        replyText = agentResult.reply;
+        console.error("[AGENT] Agent call failed:", agentResult.error);
       }
-    } catch (err) {
-      console.error("Error in /twilio/process-agent:", err);
-      console.error("Error stack:", err.stack);
-      replyText =
-        "I'm having trouble accessing the scheduling system right now. Please try again a bit later.";
     }
-  }
 
-  // If still no businessId after re-resolution, fail gracefully
-  if (!businessId) {
+    // --- Build next <Gather> with barge-in so the caller can interrupt ---
+    // Keep messages short: split into sentences and only say the first 1–2
+    const phoneReply = toPhoneSentence(replyText);
+    const sentences = phoneReply.split(/(?<=[.!?])\s+/);
+    const trimmed = sentences.slice(0, 2).join(" ");
+    
+    const gather = vr.gather({
+      input: "speech",
+      action: `/twilio/handle-gather?businessId=${encodeURIComponent(businessId)}`,
+      method: "POST",
+      language: "en-US",
+      speechTimeout: "auto",
+      bargeIn: true, // 🔑 allow interruption on every turn
+    });
+
+    // Use SSML with breaks for more natural delivery
+    gather.say(
+      {
+        voice: DEFAULT_TTS_VOICE,
+        language: "en-US",
+      },
+      `<speak>${trimmed}</speak>`
+    );
+
+    // Keep conversation going with businessId
+    vr.redirect(`/twilio/voice?businessId=${encodeURIComponent(businessId)}`);
+
+    res.type("text/xml");
+    res.send(vr.toString());
+  } catch (err) {
+    // CRITICAL: Never throw - always return valid TwiML
+    console.error("[FATAL] Error in /twilio/process-agent:", err);
+    console.error("[FATAL] Error stack:", err.stack);
+    
+    const vr = new VoiceResponse();
     vr.say(
       {
         voice: DEFAULT_TTS_VOICE,
-      language: "en-US"
-    },
-      "I'm sorry, I'm having trouble identifying your business. Please try calling again."
+        language: "en-US"
+      },
+      "I'm sorry, I'm experiencing a technical issue. Please try calling again in a moment."
     );
     vr.hangup();
     res.type("text/xml").send(vr.toString());
-    return;
   }
-
-  // --- Build next <Gather> with barge-in so the caller can interrupt ---
-  // Keep messages short: split into sentences and only say the first 1–2
-  const phoneReply = toPhoneSentence(replyText);
-  const sentences = phoneReply.split(/(?<=[.!?])\s+/);
-  const trimmed = sentences.slice(0, 2).join(" ");
-  
-  const gather = vr.gather({
-    input: "speech",
-    action: `/twilio/handle-gather?businessId=${encodeURIComponent(businessId)}`,
-    method: "POST",
-    language: "en-US",
-    speechTimeout: "auto",
-    bargeIn: true, // 🔑 allow interruption on every turn
-  });
-
-  // Use SSML with breaks for more natural delivery
-  gather.say(
-    {
-      voice: DEFAULT_TTS_VOICE,
-      language: "en-US",
-    },
-    `<speak>${trimmed}</speak>`
-  );
-
-  // Keep conversation going with businessId
-  vr.redirect(`/twilio/voice?businessId=${encodeURIComponent(businessId)}`);
-
-  res.type("text/xml");
-  res.send(vr.toString());
 });
 
 // --- Simple debug endpoint to talk to the agent over HTTP (text only) ---
@@ -807,129 +922,139 @@ app.post("/debug/agent-chat", async (req, res) => {
 //    - Optional but nice: also "answered" (for in_progress tracking)
 // ---------------------------------------------------------------------
 app.post("/twilio/status-callback", async (req, res) => {
-  const {
-    CallSid,
-    CallStatus,
-    From,
-    To,
-    CallDuration,
-    Direction,
-    Timestamp
-  } = req.body;
-
-  console.log("Twilio Status Callback:", {
-    CallSid,
-    CallStatus,
-    From,
-    To,
-    CallDuration
-  });
-
-  // B) Parse Twilio payload and map statuses
-  // Only process end states (completed, failed, busy, no-answer, canceled)
-  const endStates = ["completed", "failed", "busy", "no-answer", "canceled"];
-  
-  if (!endStates.includes(CallStatus)) {
-    // Not an end state, just acknowledge
-    res.type("text/xml").send("<Response></Response>");
-    return;
-  }
-
-  // Map statuses (as specified):
-  // completed → completed
-  // busy | failed | no-answer | canceled → failed
-  let mappedStatus;
-  if (CallStatus === "completed") {
-    mappedStatus = "completed";
-  } else {
-    // busy | failed | no-answer | canceled → failed
-    mappedStatus = "failed";
-  }
-
-  // Parse CallDuration (if present; for completed it often is)
-  // CallDuration is in seconds as a string
-  let durationSeconds = null;
-  if (CallDuration) {
-    durationSeconds = parseInt(CallDuration, 10);
-    if (isNaN(durationSeconds)) {
-      durationSeconds = null;
-    }
-  }
-
-  // Resolve businessId from To number
-  let businessId = null;
-  if (To) {
-    businessId = await resolveBusinessByTo(To);
-  }
-
-  // Clean up session when call ends
-  if (CallSid && sessions.has(CallSid)) {
-    console.log(`Cleaning up session for ended call: ${CallSid}`);
-    sessions.delete(CallSid);
-  }
-
-  // B) Call core-api /internal/calls/end with durationSeconds
-  // REQUIRED: This ensures accurate billing/usage tracking
-  // Stripe billing is meaningless if usage isn't real - this endpoint guarantees every call is tracked
+  // Wrap entire handler in try/catch to prevent any crashes
   try {
-    const coreApiUrl = `${CORE_API_BASE_URL}/internal/calls/end`;
-    const endCallBody = {
-      callSid: CallSid,
-      status: mappedStatus,  // Use mapped status (completed or failed)
-      from: From,
-      to: To,
-      businessId: businessId,
-      durationSeconds: durationSeconds,  // Duration in seconds
-      direction: Direction,
-      timestamp: Timestamp
-    };
+    const {
+      CallSid,
+      CallStatus,
+      From,
+      To,
+      CallDuration,
+      Direction,
+      Timestamp
+    } = req.body;
 
-    const headers = {
-      "Content-Type": "application/json"
-    };
-    
-    // CRITICAL: Core API strictly requires this exact header name: x-book8-internal-secret
-    // Do NOT use a different header name (authorization, x-internal-secret, etc.)
-    // Value must come from process.env.CORE_API_INTERNAL_SECRET
-    if (CORE_API_INTERNAL_SECRET) {
-      headers["x-book8-internal-secret"] = CORE_API_INTERNAL_SECRET;
-      console.log("[DEBUG] Calling /internal/calls/end with secret header (length:", CORE_API_INTERNAL_SECRET.length, ")");
-      console.log("[DEBUG] Header name: x-book8-internal-secret");
-    } else {
-      console.error("ERROR: CORE_API_INTERNAL_SECRET is missing! Core API call will fail.");
-    }
-
-    console.log("[DEBUG] Core API URL:", coreApiUrl);
-    console.log("[DEBUG] Request headers:", JSON.stringify(Object.keys(headers)));
-    console.log("[DEBUG] Request body:", JSON.stringify(endCallBody));
-
-    const coreApiRes = await fetch(coreApiUrl, {
-      method: "POST",
-      headers: headers,
-      body: JSON.stringify(endCallBody)
+    console.log("Twilio Status Callback:", {
+      CallSid,
+      CallStatus,
+      From,
+      To,
+      CallDuration
     });
 
-    // Log response status and body (safe logging - limit body length)
-    const responseText = await coreApiRes.text();
-    console.log("[DEBUG] core-api /internal/calls/end status:", coreApiRes.status);
-    console.log("[DEBUG] core-api /internal/calls/end body:", responseText.slice(0, 500));
-
-    if (!coreApiRes.ok) {
-      console.error(
-        "Core API /internal/calls/end error:",
-        coreApiRes.status,
-        responseText
-      );
-    } else {
-      console.log("Successfully notified core-api of call end:", CallSid);
+    // B) Parse Twilio payload and map statuses
+    // Only process end states (completed, failed, busy, no-answer, canceled)
+    const endStates = ["completed", "failed", "busy", "no-answer", "canceled"];
+    
+    if (!endStates.includes(CallStatus)) {
+      // Not an end state, just acknowledge
+      res.type("text/xml").send("<Response></Response>");
+      return;
     }
-  } catch (err) {
-    console.error("Error calling core-api /internal/calls/end:", err);
-    // Don't fail the callback - Twilio expects a response
-  }
 
-  // Always respond to Twilio (even if core-api call failed)
-  res.type("text/xml").send("<Response></Response>");
+    // Map statuses (as specified):
+    // completed → completed
+    // busy | failed | no-answer | canceled → failed
+    let mappedStatus;
+    if (CallStatus === "completed") {
+      mappedStatus = "completed";
+    } else {
+      // busy | failed | no-answer | canceled → failed
+      mappedStatus = "failed";
+    }
+
+    // Parse CallDuration (if present; for completed it often is)
+    // CallDuration is in seconds as a string
+    let durationSeconds = null;
+    if (CallDuration) {
+      durationSeconds = parseInt(CallDuration, 10);
+      if (isNaN(durationSeconds)) {
+        durationSeconds = null;
+      }
+    }
+
+    // Resolve businessId from To number
+    let businessId = null;
+    if (To) {
+      businessId = await resolveBusinessByTo(To);
+    }
+
+    // Clean up session when call ends
+    if (CallSid && sessions.has(CallSid)) {
+      console.log(`Cleaning up session for ended call: ${CallSid}`);
+      sessions.delete(CallSid);
+    }
+
+    // B) Call core-api /internal/calls/end with durationSeconds
+    // REQUIRED: This ensures accurate billing/usage tracking
+    // Stripe billing is meaningless if usage isn't real - this endpoint guarantees every call is tracked
+    try {
+      const coreApiUrl = `${CORE_API_BASE_URL}/internal/calls/end`;
+      const endCallBody = {
+        callSid: CallSid,
+        status: mappedStatus,  // Use mapped status (completed or failed)
+        from: From,
+        to: To,
+        businessId: businessId,
+        durationSeconds: durationSeconds,  // Duration in seconds
+        direction: Direction,
+        timestamp: Timestamp
+      };
+
+      const headers = {
+        "Content-Type": "application/json"
+      };
+      
+      // CRITICAL: Core API strictly requires this exact header name: x-book8-internal-secret
+      // Do NOT use a different header name (authorization, x-internal-secret, etc.)
+      // Value must come from process.env.CORE_API_INTERNAL_SECRET
+      if (CORE_API_INTERNAL_SECRET) {
+        headers["x-book8-internal-secret"] = CORE_API_INTERNAL_SECRET;
+        console.log("[DEBUG] Calling /internal/calls/end with secret header (length:", CORE_API_INTERNAL_SECRET.length, ")");
+        console.log("[DEBUG] Header name: x-book8-internal-secret");
+      } else {
+        console.error("ERROR: CORE_API_INTERNAL_SECRET is missing! Core API call will fail.");
+      }
+
+      console.log("[DEBUG] Core API URL:", coreApiUrl);
+      console.log("[DEBUG] Request headers:", JSON.stringify(Object.keys(headers)));
+      console.log("[DEBUG] Request body:", JSON.stringify(endCallBody));
+
+      const coreApiRes = await fetch(coreApiUrl, {
+        method: "POST",
+        headers: headers,
+        body: JSON.stringify(endCallBody)
+      });
+
+      // Log response status and body (safe logging - limit body length)
+      const responseText = await coreApiRes.text();
+      console.log("[DEBUG] core-api /internal/calls/end status:", coreApiRes.status);
+      console.log("[DEBUG] core-api /internal/calls/end body:", responseText.slice(0, 500));
+
+      if (!coreApiRes.ok) {
+        console.error(
+          "Core API /internal/calls/end error:",
+          coreApiRes.status,
+          responseText
+        );
+      } else {
+        console.log("Successfully notified core-api of call end:", CallSid);
+      }
+    } catch (err) {
+      console.error("Error calling core-api /internal/calls/end:", err);
+      // Don't fail the callback - Twilio expects a response
+    }
+
+    // Always respond to Twilio (even if core-api call failed)
+    res.type("text/xml").send("<Response></Response>");
+  } catch (err) {
+    // CRITICAL: Never throw - always return valid TwiML
+    console.error("[FATAL] Error in /twilio/status-callback:", err);
+    console.error("[FATAL] Error stack:", err.stack);
+    
+    // Always respond to Twilio (even on fatal error)
+    res.type("text/xml").send("<Response></Response>");
+  }
 });
 
 // --- 404 FALLBACK ---
