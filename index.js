@@ -242,6 +242,11 @@ app.get("/health", (req, res) => {
   res.json({ ok: true, service: "book8-voice-gateway" });
 });
 
+// --- TWILIO PING (quick smoke test for routing) ---
+app.get("/twilio/ping", (req, res) => {
+  res.status(200).send("ok");
+});
+
 // ---------------------------------------------------------------------
 //  Twilio entrypoint: /twilio/voice
 //  - Reads req.body.To (Twilio number being called)
@@ -506,21 +511,31 @@ app.post("/twilio/handle-gather", async (req, res) => {
 //  - Speaks the agent's reply back to the caller
 //  - Starts another <Gather> for multi-turn conversation
 // ---------------------------------------------------------------------
-app.get("/twilio/process-agent", async (req, res) => {
+// Support both GET and POST for /twilio/process-agent
+// Twilio may POST directly, or GET via redirect
+app.all("/twilio/process-agent", async (req, res) => {
   // Wrap entire handler in try/catch to prevent any crashes
   try {
-    console.log("[DEBUG] /twilio/process-agent called");
-    console.log("[DEBUG] Query params:", JSON.stringify(req.query));
+    // Debug logging at the top of handler
+    const method = req.method;
+    const path = req.path;
+    console.log(`[PROCESS-AGENT] ${method} ${path} called`);
+    console.log(`[PROCESS-AGENT] Query params:`, JSON.stringify(req.query));
+    console.log(`[PROCESS-AGENT] Body params:`, JSON.stringify(req.body));
     
     const vr = new VoiceResponse();
 
-    const speech = req.query.speech || "";
-    const from = req.query.from || "";
-    const to = req.query.to || "";
-    const callSid = req.query.callSid || "";
-    let businessId = req.query.businessId || "";
+    // Support both GET (query params) and POST (body params)
+    const speech = req.query.speech || req.body.speech || "";
+    const from = req.query.from || req.body.from || "";
+    const to = req.query.to || req.body.to || "";
+    const callSid = req.query.callSid || req.body.callSid || "";
+    let businessId = req.query.businessId || req.body.businessId || "";
     
-    console.log("[DEBUG] Extracted - speech:", speech ? `"${speech.substring(0, 50)}..."` : "(empty)", "businessId:", businessId);
+    // Enhanced debug logging
+    console.log(`[PROCESS-AGENT] method: ${method}, path: ${path}`);
+    console.log(`[PROCESS-AGENT] callSid: ${callSid}, businessId: ${businessId}`);
+    console.log(`[PROCESS-AGENT] speech: ${speech ? `"${speech.substring(0, 50)}..."` : "(empty)"}`);
 
     // Get session for this call
     const session = getSession(callSid);
@@ -1062,6 +1077,15 @@ app.use((req, res) => {
   res.status(404).json({ ok: false, error: "Not found" });
 });
 
+// --- STARTUP LOGGING ---
 app.listen(PORT, () => {
   console.log(`Book8 voice gateway listening on port ${PORT}`);
+  console.log("==========================================");
+  console.log("Registered Twilio routes:");
+  console.log("  POST   /twilio/voice");
+  console.log("  POST   /twilio/handle-gather");
+  console.log("  ALL    /twilio/process-agent (supports GET and POST)");
+  console.log("  POST   /twilio/status-callback");
+  console.log("  GET    /twilio/ping (smoke test)");
+  console.log("==========================================");
 });
