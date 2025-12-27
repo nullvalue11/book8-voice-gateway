@@ -1092,14 +1092,18 @@ app.use((req, res) => {
 });
 
 // --- STARTUP LOGGING ---
-app.listen(PORT, () => {
-  console.log(`Book8 voice gateway listening on port ${PORT}`);
-  console.log("==========================================");
-  console.log("Registered Twilio routes:");
-  console.log("  POST   /twilio/voice");
-  console.log("  POST   /twilio/handle-gather");
-  console.log("  ALL    /twilio/process-agent (supports GET and POST)");
-  console.log("  POST   /twilio/status-callback");
-  console.log("  GET    /twilio/ping (smoke test)");
-  console.log("==========================================");
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`[STARTUP] Book8 voice gateway listening on port ${PORT} (host: 0.0.0.0)`);
+  console.log("[STARTUP] ==========================================");
+  console.log("[STARTUP] Registered Twilio routes:");
+  console.log("[STARTUP]   POST   /twilio/voice");
+  console.log("[STARTUP]   POST   /twilio/handle-gather");
+  console.log("[STARTUP]   ALL    /twilio/process-agent (supports GET and POST)");
+  console.log("[STARTUP]   POST   /twilio/status-callback");
+  console.log("[STARTUP]   GET    /twilio/ping (smoke test)");
+  console.log("[STARTUP]   GET    /health");
+  console.log("[STARTUP]   POST   /debug/agent-chat");
+  console.log("[STARTUP] ==========================================");
+  console.log("[STARTUP] Voice Agent URL:", VOICE_AGENT_URL);
+  console.log("[STARTUP] ✅ Gateway ready to accept requests");
 });
