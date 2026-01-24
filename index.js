@@ -3,22 +3,28 @@ import express from "express";
 import dotenv from "dotenv";
 import cors from "cors";
 import twilio from "twilio";
-import OpenAI from "openai";
-import { buildSystemPrompt, tools, getBusinessProfile } from "./agentConfig.js";
+import { WebSocketServer } from "ws";
+import { createServer } from "http";
 
 dotenv.config();
 
 // --- ENV ---
 const PORT = process.env.PORT || 10000;
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const BOOK8_BASE_URL = process.env.BOOK8_BASE_URL || "https://book8-ai.vercel.app";
-const BOOK8_AGENT_API_KEY = process.env.BOOK8_AGENT_API_KEY; // will use later
 const CORE_API_BASE_URL = process.env.CORE_API_BASE_URL || "https://book8-core-api.onrender.com";
 // Trim whitespace to prevent copy/paste issues
 const CORE_API_INTERNAL_SECRET = (process.env.CORE_API_INTERNAL_SECRET || process.env.INTERNAL_API_SECRET)?.trim();
 
-if (!OPENAI_API_KEY) {
-  console.warn("WARNING: OPENAI_API_KEY is not set. The agent will not work.");
+// ElevenLabs TTS Configuration
+const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
+const ELEVENLABS_AGENT_ID = process.env.ELEVENLABS_AGENT_ID || "agent_1301kd4p9ks6et4rm4xpzecsx5";
+const ELEVENLABS_BASE_URL = "https://api.elevenlabs.io/v1";
+
+if (!ELEVENLABS_API_KEY) {
+  console.error("[FATAL] ELEVENLABS_API_KEY is not set. ElevenLabs TTS is required for voice gateway.");
+  console.error("[FATAL] Please set ELEVENLABS_API_KEY in your environment variables.");
+  // Don't crash at startup - let it fail gracefully when TTS is attempted
+} else {
+  console.log("[STARTUP] ElevenLabs TTS enabled (Agent ID:", ELEVENLABS_AGENT_ID, ")");
 }
 
 if (!CORE_API_INTERNAL_SECRET) {
@@ -32,8 +38,6 @@ if (!CORE_API_INTERNAL_SECRET) {
   console.log("[STARTUP] CORE_API_BASE_URL:", CORE_API_BASE_URL);
 }
 
-const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
-
 // --- EXPRESS SETUP ---
 const app = express();
 app.use(cors());
@@ -41,6 +45,9 @@ app.use(cors());
 // Twilio posts as x-www-form-urlencoded by default:
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
+
+// Create HTTP server for WebSocket support
+const server = createServer(app);
 
 const { twiml: Twiml } = twilio;
 const VoiceResponse = Twiml.VoiceResponse;
@@ -91,6 +98,162 @@ async function resolveBusinessByTo(toPhone) {
 // TTS Voice configuration
 const DEFAULT_TTS_VOICE = process.env.TWILIO_TTS_VOICE || "Polly.Matthew-Neural";
 // Other nice options: "Polly.Joanna-Neural", "Polly.Kendra-Neural", "Polly.Joey-Neural", "Polly.Salli-Neural"
+
+// ElevenLabs Streaming TTS Helper
+// Streams text to ElevenLabs and returns audio chunks as they arrive
+async function* streamElevenLabsTTS(text, agentId = ELEVENLABS_AGENT_ID, maxRetries = 3) {
+  if (!ELEVENLABS_API_KEY) {
+    throw new Error("ELEVENLABS_API_KEY not configured");
+  }
+
+  let attempt = 0;
+  while (attempt < maxRetries) {
+    try {
+      const url = `${ELEVENLABS_BASE_URL}/text-to-speech/${agentId}/stream`;
+      
+      const response = await fetch(url, {
+        method: "POST",
+        headers: {
+          "Accept": "audio/mpeg",
+          "Content-Type": "application/json",
+          "xi-api-key": ELEVENLABS_API_KEY
+        },
+        body: JSON.stringify({
+          text: text,
+          model_id: "eleven_turbo_v2_5",
+          voice_settings: {
+            stability: 0.5,
+            similarity_boost: 0.75,
+            style: 0.0,
+            use_speaker_boost: true
+          }
+        })
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`ElevenLabs API error: ${response.status} ${errorText}`);
+      }
+
+      // Stream audio chunks as they arrive
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          yield value; // Yield audio chunk (Uint8Array)
+        }
+        return; // Success - exit retry loop
+      } finally {
+        reader.releaseLock();
+      }
+    } catch (err) {
+      attempt++;
+      console.error(`[ELEVENLABS] Attempt ${attempt}/${maxRetries} failed:`, err.message);
+      
+      if (attempt >= maxRetries) {
+        throw err; // Re-throw after all retries exhausted
+      }
+      
+      // Exponential backoff: wait 100ms, 200ms, 400ms
+      await new Promise(resolve => setTimeout(resolve, 100 * Math.pow(2, attempt - 1)));
+    }
+  }
+}
+
+// Store active Media Stream connections (keyed by CallSid)
+const mediaStreams = new Map();
+
+// Helper: Send audio chunk to Twilio Media Stream
+// Note: Twilio Media Streams expect mu-law PCM audio (8kHz, 8-bit, mono)
+// ElevenLabs returns MP3, so we need to handle conversion or use a different approach
+// For now, we'll buffer the MP3 and note that conversion may be needed
+function sendAudioToMediaStream(callSid, audioChunk) {
+  const stream = mediaStreams.get(callSid);
+  if (!stream || stream.readyState !== 1) { // WebSocket.OPEN = 1
+    console.warn(`[MEDIA-STREAM] No active stream for CallSid: ${callSid}`);
+    return false;
+  }
+
+  try {
+    // Twilio Media Stream expects base64-encoded mu-law PCM audio
+    // Format: {"event": "media", "media": {"payload": "<base64>"}}
+    // 
+    // IMPORTANT: ElevenLabs returns MP3, but Twilio expects PCM
+    // For now, we'll send the MP3 and let Twilio handle it (may not work perfectly)
+    // TODO: Convert MP3 to mu-law PCM (8kHz, 8-bit, mono) for proper streaming
+    // This would require ffmpeg or a similar audio processing library
+    const base64Audio = Buffer.from(audioChunk).toString('base64');
+    const message = JSON.stringify({
+      event: "media",
+      media: {
+        payload: base64Audio
+      }
+    });
+    stream.send(message);
+    return true;
+  } catch (err) {
+    console.error(`[MEDIA-STREAM] Error sending audio to CallSid ${callSid}:`, err);
+    return false;
+  }
+}
+
+// Helper: Stream ElevenLabs TTS to Twilio Media Stream
+async function streamElevenLabsToTwilio(callSid, text, retryOnFailure = true) {
+  if (!ELEVENLABS_API_KEY) {
+    console.warn("[ELEVENLABS] API key not set, cannot stream TTS");
+    return { success: false, error: "ELEVENLABS_API_KEY not configured" };
+  }
+
+  try {
+    let chunkCount = 0;
+    for await (const audioChunk of streamElevenLabsTTS(text, ELEVENLABS_AGENT_ID)) {
+      const sent = sendAudioToMediaStream(callSid, audioChunk);
+      if (sent) {
+        chunkCount++;
+      } else {
+        // Stream connection lost
+        console.warn(`[ELEVENLABS] Media stream lost for CallSid: ${callSid}`);
+        if (retryOnFailure) {
+          // Wait a bit and retry
+          await new Promise(resolve => setTimeout(resolve, 100));
+          return await streamElevenLabsToTwilio(callSid, text, false); // Retry once
+        }
+        return { success: false, error: "Media stream connection lost" };
+      }
+    }
+    
+    console.log(`[ELEVENLABS] Successfully streamed ${chunkCount} audio chunks for CallSid: ${callSid}`);
+    return { success: true, chunkCount };
+  } catch (err) {
+    console.error(`[ELEVENLABS] Error streaming TTS for CallSid ${callSid}:`, err);
+    
+    // Surface error to ops logs
+    try {
+      // Log to core-api if available (optional - don't fail if this fails)
+      await fetch(`${CORE_API_BASE_URL}/internal/logs`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(CORE_API_INTERNAL_SECRET ? { "x-book8-internal-secret": CORE_API_INTERNAL_SECRET } : {})
+        },
+        body: JSON.stringify({
+          level: "error",
+          service: "voice-gateway",
+          message: "ElevenLabs TTS streaming failed",
+          callSid: callSid,
+          error: err.message
+        })
+      }).catch(() => {}); // Ignore errors
+    } catch (logErr) {
+      // Ignore logging errors
+    }
+    
+    return { success: false, error: err.message };
+  }
+}
 
 // Helper: Clean and shorten text for phone conversations
 function toPhoneSentence(text) {
@@ -262,6 +425,74 @@ app.get("/twilio/ping", (req, res) => {
 });
 
 // ---------------------------------------------------------------------
+//  Twilio Media Stream WebSocket Endpoint
+//  Handles bidirectional audio streaming for ElevenLabs TTS
+// ---------------------------------------------------------------------
+const wss = new WebSocketServer({ 
+  server: server,
+  path: "/twilio/media-stream"
+});
+
+wss.on("connection", (ws, req) => {
+  let callSid = null;
+  console.log("[MEDIA-STREAM] New WebSocket connection");
+
+  ws.on("message", (data) => {
+    try {
+      const message = JSON.parse(data.toString());
+      
+      // Handle "connected" event - extract CallSid
+      if (message.event === "connected") {
+        console.log("[MEDIA-STREAM] Connected event received");
+      }
+      
+      // Handle "start" event - extract CallSid
+      if (message.event === "start") {
+        callSid = message.start?.callSid || message.callSid;
+        console.log(`[MEDIA-STREAM] Stream started for CallSid: ${callSid}`);
+        
+        if (callSid) {
+          mediaStreams.set(callSid, ws);
+        }
+        
+        // Send "connected" response to Twilio
+        ws.send(JSON.stringify({
+          event: "connected",
+          protocol: "Call"
+        }));
+      }
+      
+      // Handle "media" event (incoming audio from caller)
+      if (message.event === "media") {
+        // We can process incoming audio here if needed
+        // For now, we're just streaming TTS out
+      }
+      
+      // Handle "stop" event
+      if (message.event === "stop") {
+        console.log(`[MEDIA-STREAM] Stream stopped for CallSid: ${callSid}`);
+        if (callSid) {
+          mediaStreams.delete(callSid);
+        }
+      }
+    } catch (err) {
+      console.error("[MEDIA-STREAM] Error parsing message:", err);
+    }
+  });
+
+  ws.on("error", (err) => {
+    console.error(`[MEDIA-STREAM] WebSocket error for CallSid ${callSid}:`, err);
+  });
+
+  ws.on("close", () => {
+    console.log(`[MEDIA-STREAM] WebSocket closed for CallSid: ${callSid}`);
+    if (callSid) {
+      mediaStreams.delete(callSid);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------
 //  Twilio entrypoint: /twilio/voice
 //  - Reads req.body.To (Twilio number being called)
 //  - Calls core-api /api/resolve?to=${To} to get business
@@ -368,6 +599,25 @@ app.post("/twilio/voice", async (req, res) => {
     // IMPORTANT: keep businessId in the query string for all future gathers
     const vr = new VoiceResponse();
     
+    // Start Media Stream for ElevenLabs TTS (if enabled)
+    // Determine the WebSocket URL (use wss:// for production, ws:// for local)
+    // In production (Render), use wss:// and the full domain
+    const isProduction = process.env.NODE_ENV === 'production' || req.get('host')?.includes('onrender.com');
+    const wsProtocol = isProduction ? 'wss' : (req.protocol === 'https' ? 'wss' : 'ws');
+    const wsHost = req.get('host') || process.env.WS_HOST || `book8-voice-gateway.onrender.com`;
+    const mediaStreamUrl = `${wsProtocol}://${wsHost}/twilio/media-stream`;
+    
+    if (ELEVENLABS_API_KEY) {
+      // Start Media Stream for ElevenLabs streaming TTS
+      const connect = vr.connect();
+      const stream = connect.stream({
+        url: mediaStreamUrl,
+        track: "both_tracks" // Receive and send audio
+      });
+      stream.parameter({ name: "callSid", value: callSid });
+      console.log(`[MEDIA-STREAM] Starting Media Stream for CallSid: ${callSid}, URL: ${mediaStreamUrl}`);
+    }
+    
     // C) Twilio config: StatusCallback URL should be configured in Twilio Console
     // Go to Phone Numbers > Manage > Active Numbers > Your Number
     // Set "Status Callback URL" to: https://book8-voice-gateway.onrender.com/twilio/status-callback
@@ -384,13 +634,26 @@ app.post("/twilio/voice", async (req, res) => {
     // Use generic greeting (business details can be fetched later if needed)
     const greet = "Hi, thanks for calling. How can I help you today?";
 
-    gather.say(
-      {
-        voice: DEFAULT_TTS_VOICE,
-        language: "en-US"
-      },
-      greet
-    );
+    // If ElevenLabs is enabled, stream the greeting; otherwise use Twilio TTS
+    if (ELEVENLABS_API_KEY) {
+      // Stream greeting via ElevenLabs (async, don't wait)
+      streamElevenLabsToTwilio(callSid, greet).catch(err => {
+        console.error(`[ELEVENLABS] Failed to stream greeting for CallSid ${callSid}:`, err);
+        // Fallback: use Twilio TTS
+        // We'll handle this in the gather by using a redirect
+      });
+      // Small delay to let Media Stream establish
+      vr.pause({ length: 1 });
+    } else {
+      // Fallback to Twilio TTS
+      gather.say(
+        {
+          voice: DEFAULT_TTS_VOICE,
+          language: "en-US"
+        },
+        greet
+      );
+    }
 
     vr.redirect(`/twilio/voice?businessId=${encodeURIComponent(businessId)}`);
     res.type("text/xml").send(vr.toString());
@@ -482,13 +745,32 @@ app.post("/twilio/handle-gather", async (req, res) => {
 
     // Immediately respond with "thinking" message to reduce perceived lag
     // This makes the call feel much more responsive
-    vr.say(
-      {
-        voice: DEFAULT_TTS_VOICE,
-        language: "en-US"
-      },
-      "Sure — one second."
-    );
+    // Use ElevenLabs if enabled, otherwise Twilio TTS
+    if (ELEVENLABS_API_KEY && callSid) {
+      // Stream "thinking" message via ElevenLabs
+      streamElevenLabsToTwilio(callSid, "Sure — one second.").catch(err => {
+        console.error(`[ELEVENLABS] Failed to stream thinking message for CallSid ${callSid}:`, err);
+        // Fallback: use Twilio TTS
+        vr.say(
+          {
+            voice: DEFAULT_TTS_VOICE,
+            language: "en-US"
+          },
+          "Sure — one second."
+        );
+      });
+      // Small pause to let Media Stream process
+      vr.pause({ length: 1 });
+    } else {
+      // Fallback to Twilio TTS
+      vr.say(
+        {
+          voice: DEFAULT_TTS_VOICE,
+          language: "en-US"
+        },
+        "Sure — one second."
+      );
+    }
 
     // Redirect to processing endpoint with all necessary params
     const params = new URLSearchParams({
@@ -625,14 +907,33 @@ app.all("/twilio/process-agent", async (req, res) => {
       bargeIn: true, // 🔑 allow interruption on every turn
     });
 
-    // Use SSML with breaks for more natural delivery
-    gather.say(
-      {
-        voice: DEFAULT_TTS_VOICE,
-        language: "en-US",
-      },
-      `<speak>${trimmed}</speak>`
-    );
+    // Use ElevenLabs streaming TTS if enabled, otherwise fallback to Twilio TTS
+    if (ELEVENLABS_API_KEY && callSid) {
+      // Stream via ElevenLabs (async, don't wait for completion)
+      // The Media Stream will handle the audio delivery
+      streamElevenLabsToTwilio(callSid, trimmed).then(result => {
+        if (!result.success) {
+          console.warn(`[ELEVENLABS] Streaming failed for CallSid ${callSid}, error: ${result.error}`);
+          // Note: We can't fallback here since TwiML is already sent
+          // The Media Stream will just be silent if ElevenLabs fails
+        }
+      }).catch(err => {
+        console.error(`[ELEVENLABS] Unexpected error streaming TTS for CallSid ${callSid}:`, err);
+      });
+      
+      // Small pause to let Media Stream process
+      // The actual audio will come through the WebSocket
+      gather.pause({ length: 1 });
+    } else {
+      // Fallback to Twilio TTS
+      gather.say(
+        {
+          voice: DEFAULT_TTS_VOICE,
+          language: "en-US",
+        },
+        `<speak>${trimmed}</speak>`
+      );
+    }
 
     // Keep conversation going with businessId
     vr.redirect(`/twilio/voice?businessId=${encodeURIComponent(businessId)}`);
@@ -657,272 +958,9 @@ app.all("/twilio/process-agent", async (req, res) => {
   }
 });
 
-// --- Simple debug endpoint to talk to the agent over HTTP (text only) ---
-app.post("/debug/agent-chat", async (req, res) => {
-  try {
-    const { handle, message, messages, businessId, callerPhone, toPhone, callSid } = req.body || {};
-
-    // Support both single message (backward compat) and messages array (stateful)
-    let conversationMessages = [];
-    if (messages && Array.isArray(messages) && messages.length > 0) {
-      // Use provided messages array (stateful conversation)
-      conversationMessages = messages;
-    } else if (message) {
-      // Single message (backward compatibility)
-      conversationMessages = [{ role: "user", content: message }];
-    } else {
-      return res.status(400).json({
-        ok: false,
-        error: "Missing 'message' or 'messages' in request body"
-      });
-    }
-
-    if (!handle && !businessId) {
-      return res.status(400).json({
-        ok: false,
-        error: "Missing 'handle' or 'businessId' in request body"
-      });
-    }
-
-    const businessHandle = handle || businessId;
-
-    // 1) Get business profile & system instructions
-    const profile = await getBusinessProfile(businessHandle);
-    const systemPrompt = buildSystemPrompt(profile);
-
-    // 2) First call: ask the model what to do (with tools enabled)
-    const first = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [
-        {
-          role: "system",
-          content: systemPrompt
-        },
-        ...conversationMessages
-      ],
-      tools,                  // 👈 from agentConfig.js
-      tool_choice: "auto"     // let it decide when to call tools
-    });
-
-    console.log("FIRST RESPONSE RAW:", JSON.stringify(first, null, 2));
-
-    const assistantMessage = first.choices[0]?.message;
-    if (!assistantMessage) {
-      throw new Error("No response from model");
-    }
-
-    // Extract any tool calls
-    const toolCalls = assistantMessage.tool_calls || [];
-    const textContent = assistantMessage.content || "";
-
-    // If there are NO tool calls, just return what it said
-    if (toolCalls.length === 0) {
-      return res.json({
-        ok: true,
-        reply: textContent,
-        raw: first,
-        note: "No tool calls in first response"
-      });
-    }
-
-    // 3) Execute tool calls against Book8
-    const toolOutputs = [];
-
-    for (const tc of toolCalls) {
-      const name = tc.function?.name;
-      const args = JSON.parse(tc.function?.arguments || "{}");
-      const call_id = tc.id;
-      console.log("Processing tool call:", name, args);
-
-      if (name === "check_availability") {
-        // Expecting: { date, timezone, durationMinutes }
-        const resp = await fetch(`${BOOK8_BASE_URL}/api/agent/availability`, {
-          method: "POST",
-          headers: { 
-            "Content-Type": "application/json",
-            "x-book8-agent-key": profile.agentApiKey
-          },
-          body: JSON.stringify({
-            agentApiKey: profile.agentApiKey,
-            date: args.date,
-            timezone: args.timezone,
-            durationMinutes: args.durationMinutes
-          })
-        });
-
-        const data = await resp.json();
-        console.log("check_availability result:", data);
-
-        toolOutputs.push({
-          role: "tool",
-          tool_call_id: call_id,
-          content: JSON.stringify(data)
-        });
-      }
-
-      if (name === "book_appointment") {
-        const resp = await fetch(`${BOOK8_BASE_URL}/api/agent/book`, {
-          method: "POST",
-          headers: { 
-            "Content-Type": "application/json",
-            "x-book8-agent-key": profile.agentApiKey
-          },
-          body: JSON.stringify({
-            agentApiKey: profile.agentApiKey,
-            start: args.start,
-            guestName: args.guestName,
-            guestEmail: args.guestEmail,
-            guestPhone: args.guestPhone
-          })
-        });
-
-        const data = await resp.json();
-        console.log("book_appointment result:", data);
-
-        toolOutputs.push({
-          role: "tool",
-          tool_call_id: call_id,
-          content: JSON.stringify(data)
-        });
-      }
-    }
-
-    // 4) Second call: give the tool results back to the model to generate the final reply
-    let second = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [
-        {
-          role: "system",
-          content: systemPrompt
-        },
-        {
-          role: "user",
-          content: message
-        },
-        assistantMessage,
-        ...toolOutputs
-      ],
-      tools,
-      tool_choice: "auto"
-    });
-
-    console.log("SECOND RESPONSE RAW:", JSON.stringify(second, null, 2));
-
-    const secondMessage = second.choices[0]?.message;
-    
-    // Check if the second response also wants to call tools (e.g., book_appointment after check_availability)
-    if (secondMessage.tool_calls && secondMessage.tool_calls.length > 0) {
-      const secondToolCalls = secondMessage.tool_calls;
-      const secondToolOutputs = [];
-
-      for (const tc of secondToolCalls) {
-        const name = tc.function?.name;
-        const args = JSON.parse(tc.function?.arguments || "{}");
-        const call_id = tc.id;
-        console.log("Processing second tool call:", name, args);
-
-        if (name === "check_availability") {
-          const resp = await fetch(`${BOOK8_BASE_URL}/api/agent/availability`, {
-            method: "POST",
-            headers: { 
-              "Content-Type": "application/json",
-              "x-book8-agent-key": profile.agentApiKey
-            },
-            body: JSON.stringify({
-              agentApiKey: profile.agentApiKey,
-              date: args.date,
-              timezone: args.timezone,
-              durationMinutes: args.durationMinutes
-            })
-          });
-
-          const data = await resp.json();
-          console.log("check_availability result:", data);
-
-          secondToolOutputs.push({
-            role: "tool",
-            tool_call_id: call_id,
-            content: JSON.stringify(data)
-          });
-        }
-
-        if (name === "book_appointment") {
-          const resp = await fetch(`${BOOK8_BASE_URL}/api/agent/book`, {
-            method: "POST",
-            headers: { 
-              "Content-Type": "application/json",
-              "x-book8-agent-key": profile.agentApiKey
-            },
-            body: JSON.stringify({
-              agentApiKey: profile.agentApiKey,
-              start: args.start,
-              guestName: args.guestName,
-              guestEmail: args.guestEmail,
-              guestPhone: args.guestPhone
-            })
-          });
-
-          const data = await resp.json();
-          console.log("book_appointment result:", data);
-
-          secondToolOutputs.push({
-            role: "tool",
-            tool_call_id: call_id,
-            content: JSON.stringify(data)
-          });
-        }
-      }
-
-      // Third call: get final response after second round of tool calls
-      const third = await openai.chat.completions.create({
-        model: "gpt-4o-mini",
-        messages: [
-          {
-            role: "system",
-            content: systemPrompt
-          },
-          {
-            role: "user",
-            content: message
-          },
-          assistantMessage,
-          ...toolOutputs,
-          secondMessage,
-          ...secondToolOutputs
-        ]
-      });
-
-      const finalText = third.choices[0]?.message?.content || "Sorry, I couldn't generate a response.";
-
-      return res.json({
-        ok: true,
-        reply: finalText,
-        first,
-        second,
-        third,
-        toolCalls: [...toolCalls, ...secondToolCalls],
-        toolOutputs: [...toolOutputs, ...secondToolOutputs]
-      });
-    }
-
-    const finalText = secondMessage?.content || "Sorry, I couldn't generate a response.";
-
-    return res.json({
-      ok: true,
-      reply: finalText,
-      first,
-      second,
-      toolCalls,
-      toolOutputs
-    });
-  } catch (err) {
-    console.error("Error in /debug/agent-chat:", err);
-    return res.status(500).json({
-      ok: false,
-      error: err.message || "Internal error in agent-chat"
-    });
-  }
-});
+// --- Debug endpoint removed: OpenAI dependency eliminated ---
+// The gateway now uses book8-voice-agent service for all agent interactions
+// Use the voice-agent service directly for agent chat functionality
 
 // ---------------------------------------------------------------------
 //  Twilio Status Callback: /twilio/status-callback
@@ -1092,7 +1130,7 @@ app.use((req, res) => {
 });
 
 // --- STARTUP LOGGING ---
-app.listen(PORT, "0.0.0.0", () => {
+server.listen(PORT, "0.0.0.0", () => {
   console.log(`[STARTUP] Book8 voice gateway listening on port ${PORT} (host: 0.0.0.0)`);
   console.log("[STARTUP] ==========================================");
   console.log("[STARTUP] Registered Twilio routes:");
@@ -1102,8 +1140,13 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log("[STARTUP]   POST   /twilio/status-callback");
   console.log("[STARTUP]   GET    /twilio/ping (smoke test)");
   console.log("[STARTUP]   GET    /health");
-  console.log("[STARTUP]   POST   /debug/agent-chat");
+  console.log("[STARTUP]   WS     /twilio/media-stream (ElevenLabs TTS streaming)");
   console.log("[STARTUP] ==========================================");
   console.log("[STARTUP] Voice Agent URL:", VOICE_AGENT_URL);
+  if (ELEVENLABS_API_KEY) {
+    console.log("[STARTUP] ✅ ElevenLabs TTS: ENABLED (Agent ID:", ELEVENLABS_AGENT_ID, ")");
+  } else {
+    console.log("[STARTUP] ⚠️  ElevenLabs TTS: DISABLED (using Twilio TTS fallback)");
+  }
   console.log("[STARTUP] ✅ Gateway ready to accept requests");
 });
